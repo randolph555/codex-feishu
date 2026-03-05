@@ -1,16 +1,57 @@
 import { EventEmitter, once } from "node:events";
+import fs from "node:fs";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
 
-function getCodexSpawnOptions(base = {}) {
-  if (process.platform === "win32") {
-    return {
-      ...base,
-      // Windows commonly resolves codex via codex.cmd; shell mode keeps it executable.
-      shell: true,
-    };
+function normalizeExecutable(raw) {
+  const text = String(raw ?? "").trim();
+  if (!text) {
+    return text;
   }
-  return base;
+  const quoted =
+    (text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"));
+  return quoted ? text.slice(1, -1).trim() : text;
+}
+
+function quoteForCmd(arg) {
+  const text = String(arg ?? "");
+  if (text.length === 0) {
+    return '""';
+  }
+  if (!/[\s"&|<>^()]/.test(text)) {
+    return text;
+  }
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function sanitizeSpawnCwd(cwd) {
+  if (typeof cwd !== "string" || !cwd.trim()) {
+    return process.cwd();
+  }
+  const normalized = cwd.trim();
+  if (process.platform === "win32") {
+    try {
+      if (!fs.existsSync(normalized)) {
+        return process.cwd();
+      }
+    } catch {
+      return process.cwd();
+    }
+  }
+  return normalized;
+}
+
+function spawnCodex(codexBin, args, options = {}) {
+  const bin = normalizeExecutable(codexBin);
+  const spawnOptions = {
+    ...options,
+    cwd: sanitizeSpawnCwd(options.cwd),
+  };
+  if (process.platform !== "win32") {
+    return spawn(bin, args, spawnOptions);
+  }
+  const command = [bin, ...args].map(quoteForCmd).join(" ");
+  return spawn("cmd.exe", ["/d", "/s", "/c", command], spawnOptions);
 }
 
 function normalizeJsonRpcPayload(payload) {
@@ -88,14 +129,10 @@ async function probeSubcommand(codexBin, args, timeoutMs = 2_500) {
     let stdout = "";
     let stderr = "";
     let timer = null;
-    const child = spawn(
-      codexBin,
-      args,
-      getCodexSpawnOptions({
-        stdio: ["ignore", "pipe", "pipe"],
-        env: process.env,
-      }),
-    );
+    const child = spawnCodex(codexBin, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: process.env,
+    });
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString("utf8");
     });
@@ -150,10 +187,11 @@ async function probeSubcommand(codexBin, args, timeoutMs = 2_500) {
 export class AppServerClient extends EventEmitter {
   constructor(options = {}) {
     super();
-    this.codexBin =
+    this.codexBin = normalizeExecutable(
       options.codexBin ||
       process.env.CODEX_BIN ||
-      (process.platform === "win32" ? "codex.cmd" : "codex");
+      (process.platform === "win32" ? "codex.cmd" : "codex"),
+    );
     this.transport = options.transport || process.env.CODEX_FEISHU_TRANSPORT || "auto";
     this.protoCwd = options.protoCwd || process.env.CODEX_FEISHU_CWD || process.cwd();
     this.protoModel = options.protoModel || process.env.CODEX_FEISHU_MODEL || "gpt-5.3-codex";
@@ -254,15 +292,11 @@ export class AppServerClient extends EventEmitter {
   }
 
   async startLegacyAppServer() {
-    const child = spawn(
-      this.codexBin,
-      ["app-server", "--listen", "stdio://"],
-      getCodexSpawnOptions({
-        stdio: ["pipe", "pipe", "pipe"],
-        env: process.env,
-        cwd: this.protoCwd,
-      }),
-    );
+    const child = spawnCodex(this.codexBin, ["app-server", "--listen", "stdio://"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: process.env,
+      cwd: this.protoCwd,
+    });
     this.process = child;
 
     child.on("error", (err) => {
@@ -331,15 +365,11 @@ export class AppServerClient extends EventEmitter {
   }
 
   async startProto() {
-    const child = spawn(
-      this.codexBin,
-      ["proto"],
-      getCodexSpawnOptions({
-        stdio: ["pipe", "pipe", "pipe"],
-        env: process.env,
-        cwd: this.protoCwd,
-      }),
-    );
+    const child = spawnCodex(this.codexBin, ["proto"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: process.env,
+      cwd: this.protoCwd,
+    });
     this.process = child;
     this.protoReady = {};
 
