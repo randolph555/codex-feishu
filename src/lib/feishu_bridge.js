@@ -198,7 +198,7 @@ export class FeishuBridge {
       Lark = await import("@larksuiteoapi/node-sdk");
     } catch (err) {
       this.lastError =
-        "missing @larksuiteoapi/node-sdk. Run: npm i -g @xxx/codex-feishu (with dependencies)";
+        "missing @larksuiteoapi/node-sdk. Run: npm i -g @openai-lite/codex-feishu (with dependencies)";
       this.onEvent({
         type: "feishu_sdk_missing",
         error: err?.message ?? String(err),

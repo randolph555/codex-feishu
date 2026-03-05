@@ -1,5 +1,5 @@
 {
-  "name": "@xxx/codex-feishu",
+  "name": "@openai-lite/codex-feishu",
   "version": "0.1.0",
   "description": "Feishu bridge for Codex with dual-end synchronized conversations.",
   "type": "module",

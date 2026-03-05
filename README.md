@@ -53,7 +53,7 @@ Feishu side experience snapshots:
 ```bash
 npm i -g @openai/codex  #安装codex(如果已安装可以跳过)
 
-npm i -g @xxx/codex-feishu
+npm i -g @openai-lite/codex-feishu
 ```
 
 ## Quick start (macOS / Linux)
@@ -77,7 +77,7 @@ codex-feishu qrcode
 ## Quick start (Windows)
 
 ```powershell
-npm i -g @xxx/codex-feishu
+npm i -g @openai-lite/codex-feishu
 codex-feishu init --app-id <FEISHU_APP_ID> --app-secret <FEISHU_APP_SECRET> daemon
 ```
 
