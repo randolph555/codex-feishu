@@ -1,0 +1,23 @@
+{
+  "name": "@xxx/codex-feishu",
+  "version": "0.1.0",
+  "description": "Feishu bridge for Codex with dual-end synchronized conversations.",
+  "type": "module",
+  "bin": {
+    "codex-feishu": "bin/codex-feishu.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "*",
+    "qrcode": "^1.5.4"
+  },
+  "files": [
+    "bin",
+    "src",
+    "docs",
+    "README.md"
+  ],
+  "license": "Apache-2.0"
+}
