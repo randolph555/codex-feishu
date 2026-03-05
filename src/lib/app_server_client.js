@@ -2,6 +2,17 @@ import { EventEmitter, once } from "node:events";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
 
+function getCodexSpawnOptions(base = {}) {
+  if (process.platform === "win32") {
+    return {
+      ...base,
+      // Windows commonly resolves codex via codex.cmd; shell mode keeps it executable.
+      shell: true,
+    };
+  }
+  return base;
+}
+
 function normalizeJsonRpcPayload(payload) {
   if (!payload || typeof payload !== "object") {
     return null;
@@ -77,10 +88,14 @@ async function probeSubcommand(codexBin, args, timeoutMs = 2_500) {
     let stdout = "";
     let stderr = "";
     let timer = null;
-    const child = spawn(codexBin, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: process.env,
-    });
+    const child = spawn(
+      codexBin,
+      args,
+      getCodexSpawnOptions({
+        stdio: ["ignore", "pipe", "pipe"],
+        env: process.env,
+      }),
+    );
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString("utf8");
     });
@@ -135,7 +150,10 @@ async function probeSubcommand(codexBin, args, timeoutMs = 2_500) {
 export class AppServerClient extends EventEmitter {
   constructor(options = {}) {
     super();
-    this.codexBin = options.codexBin || process.env.CODEX_BIN || "codex";
+    this.codexBin =
+      options.codexBin ||
+      process.env.CODEX_BIN ||
+      (process.platform === "win32" ? "codex.cmd" : "codex");
     this.transport = options.transport || process.env.CODEX_FEISHU_TRANSPORT || "auto";
     this.protoCwd = options.protoCwd || process.env.CODEX_FEISHU_CWD || process.cwd();
     this.protoModel = options.protoModel || process.env.CODEX_FEISHU_MODEL || "gpt-5.3-codex";
@@ -236,11 +254,15 @@ export class AppServerClient extends EventEmitter {
   }
 
   async startLegacyAppServer() {
-    const child = spawn(this.codexBin, ["app-server", "--listen", "stdio://"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
-      cwd: this.protoCwd,
-    });
+    const child = spawn(
+      this.codexBin,
+      ["app-server", "--listen", "stdio://"],
+      getCodexSpawnOptions({
+        stdio: ["pipe", "pipe", "pipe"],
+        env: process.env,
+        cwd: this.protoCwd,
+      }),
+    );
     this.process = child;
 
     child.on("error", (err) => {
@@ -309,11 +331,15 @@ export class AppServerClient extends EventEmitter {
   }
 
   async startProto() {
-    const child = spawn(this.codexBin, ["proto"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
-      cwd: this.protoCwd,
-    });
+    const child = spawn(
+      this.codexBin,
+      ["proto"],
+      getCodexSpawnOptions({
+        stdio: ["pipe", "pipe", "pipe"],
+        env: process.env,
+        cwd: this.protoCwd,
+      }),
+    );
     this.process = child;
     this.protoReady = {};
 

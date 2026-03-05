@@ -5944,6 +5944,13 @@ export async function runDaemon() {
       signal: info.signal ?? null,
     });
   });
+  app.on("error", async (err) => {
+    await appendEvent(store, {
+      source: "app_server",
+      type: "error",
+      error: err?.message ?? String(err),
+    });
+  });
 
   try {
     await app.ensureStarted();

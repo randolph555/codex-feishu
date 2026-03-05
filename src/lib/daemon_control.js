@@ -56,6 +56,22 @@ async function isDaemonRpcResponsive(timeoutMs = 1000) {
   }
 }
 
+async function readLogTail(logPath, maxLines = 60) {
+  try {
+    const text = await readTextIfExists(logPath);
+    if (!text) {
+      return "";
+    }
+    const lines = text
+      .split(/\r?\n/)
+      .filter((line) => line.trim().length > 0)
+      .slice(-maxLines);
+    return lines.join("\n");
+  } catch {
+    return "";
+  }
+}
+
 async function stopByPid(pid, timeoutMs = 3000) {
   if (!isPidAlive(pid)) {
     return { action: "already_stopped", pid };
@@ -201,7 +217,7 @@ export async function restartDaemonDetached() {
     for (const cliEntry of candidateEntries) {
       attempts.push([process.execPath, [cliEntry, "daemon"]]);
     }
-    attempts.push(["codex-feishu", ["daemon"]]);
+    attempts.push(["cmd.exe", ["/d", "/s", "/c", "codex-feishu daemon"]]);
   } else {
     attempts.push(["codex-feishu", ["daemon"]]);
     for (const cliEntry of candidateEntries) {
@@ -234,8 +250,10 @@ export async function restartDaemonDetached() {
     failedAttempts.push(`${cmd} ${args.join(" ")} => ${startResult.error}`);
   }
   if (!startResult.ok) {
+    const logTail = await readLogTail(logPath, 80);
     const details = failedAttempts.length > 0 ? `; attempts: ${failedAttempts.join(" | ")}` : "";
-    throw new Error(`failed to start daemon in background: ${startResult.error}${details}`);
+    const logHint = logTail ? `; daemon.log tail:\n${logTail}` : "";
+    throw new Error(`failed to start daemon in background: ${startResult.error}${details}${logHint}`);
   }
 
   if (startResult.pid) {
