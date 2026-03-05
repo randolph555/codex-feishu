@@ -120,6 +120,7 @@ async function trySpawnDetached(cmd, args, logPath) {
 
   return await new Promise((resolve) => {
     let settled = false;
+    const graceMs = process.platform === "win32" ? 1500 : 800;
     const finish = (value) => {
       if (settled) {
         return;
@@ -133,13 +134,25 @@ async function trySpawnDetached(cmd, args, logPath) {
       resolve(value);
     };
 
+    child.once("exit", (code, signal) => {
+      finish({
+        ok: false,
+        error: `process exited early (cmd=${cmd}) code=${code ?? "null"} signal=${signal ?? "null"}`,
+      });
+    });
+
     child.once("error", (err) => {
       finish({ ok: false, error: err?.message ?? String(err) });
     });
 
     child.once("spawn", () => {
-      child.unref();
-      finish({ ok: true, pid: child.pid });
+      setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        child.unref();
+        finish({ ok: true, pid: child.pid });
+      }, graceMs);
     });
   });
 }
@@ -168,11 +181,24 @@ export async function restartDaemonDetached() {
   }
   await removePidFile();
 
-  let startResult = await trySpawnDetached("codex-feishu", ["daemon"], logPath);
-  if (!startResult.ok) {
-    const entry = process.argv[1];
+  const entry = process.argv[1];
+  const attempts = [];
+  if (process.platform === "win32" && entry) {
+    attempts.push([process.execPath, [entry, "daemon"]]);
+    attempts.push(["codex-feishu", ["daemon"]]);
+  } else {
+    attempts.push(["codex-feishu", ["daemon"]]);
     if (entry) {
-      startResult = await trySpawnDetached(process.execPath, [entry, "daemon"], logPath);
+      attempts.push([process.execPath, [entry, "daemon"]]);
+    }
+  }
+
+  let startResult = { ok: false, error: "no_start_attempt" };
+  for (const [cmd, args] of attempts) {
+    // eslint-disable-next-line no-await-in-loop
+    startResult = await trySpawnDetached(cmd, args, logPath);
+    if (startResult.ok) {
+      break;
     }
   }
   if (!startResult.ok) {

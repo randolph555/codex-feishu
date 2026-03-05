@@ -85,6 +85,7 @@ export async function runCli(argv) {
     await runInit(flags, { startDaemon });
     if (startDaemon) {
       const result = await restartDaemonDetached();
+      const bindWaitMs = process.platform === "win32" ? 40000 : 20000;
       // eslint-disable-next-line no-console
       console.log("\nDaemon:");
       // eslint-disable-next-line no-console
@@ -106,13 +107,13 @@ export async function runCli(argv) {
       // eslint-disable-next-line no-console
       console.log(`- Watch log: ${watchLogCommand(result.logPath)}`);
       // eslint-disable-next-line no-console
-      console.log("- Bind: waiting for daemon readiness (up to 20s)...");
+      console.log(`- Bind: waiting for daemon readiness (up to ${Math.round(bindWaitMs / 1000)}s)...`);
 
       try {
         const qr = await fetchQrcodeWithRetry({
           purpose: "init_daemon_start",
           cwdHint: process.cwd(),
-          maxWaitMs: 20000,
+          maxWaitMs: bindWaitMs,
           intervalMs: 500,
           timeoutMs: 1500,
         });

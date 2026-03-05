@@ -1,6 +1,6 @@
 {
   "name": "@openai-lite/codex-feishu",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Feishu bridge for Codex with dual-end synchronized conversations.",
   "type": "module",
   "bin": {
