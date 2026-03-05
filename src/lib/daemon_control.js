@@ -2,7 +2,8 @@ import fs from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { ensureDir, readTextIfExists, writeText } from "./fs_utils.js";
-import { getDaemonLogPath, getDaemonPidPath, getRunDir } from "./paths.js";
+import { getBridgeRpcEndpoint, getDaemonLogPath, getDaemonPidPath, getRunDir } from "./paths.js";
+import { callJsonRpc } from "./uds_rpc.js";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -42,6 +43,16 @@ async function removePidFile() {
     if (!err || err.code !== "ENOENT") {
       throw err;
     }
+  }
+}
+
+async function isDaemonRpcResponsive(timeoutMs = 1000) {
+  try {
+    const endpoint = getBridgeRpcEndpoint();
+    const pong = await callJsonRpc(endpoint, "ping", {}, { timeoutMs });
+    return Boolean(pong?.ok);
+  } catch {
+    return false;
   }
 }
 
@@ -206,6 +217,20 @@ export async function restartDaemonDetached() {
     if (startResult.ok) {
       break;
     }
+    // On Windows, daemon may already be alive (port occupied by existing daemon)
+    // while a new detached process exits early. In that case, treat as healthy.
+    // eslint-disable-next-line no-await-in-loop
+    const responsive = await isDaemonRpcResponsive(1200);
+    if (responsive) {
+      // eslint-disable-next-line no-await-in-loop
+      const current = await readPidFile();
+      startResult = {
+        ok: true,
+        pid: current.pid ?? null,
+        reused: true,
+      };
+      break;
+    }
     failedAttempts.push(`${cmd} ${args.join(" ")} => ${startResult.error}`);
   }
   if (!startResult.ok) {
@@ -213,7 +238,9 @@ export async function restartDaemonDetached() {
     throw new Error(`failed to start daemon in background: ${startResult.error}${details}`);
   }
 
-  await writeText(pidPath, `${startResult.pid}\n`);
+  if (startResult.pid) {
+    await writeText(pidPath, `${startResult.pid}\n`);
+  }
   return {
     pidPath,
     logPath,
