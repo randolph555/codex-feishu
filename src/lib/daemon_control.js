@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { ensureDir, readTextIfExists, writeText } from "./fs_utils.js";
 import { getDaemonLogPath, getDaemonPidPath, getRunDir } from "./paths.js";
 
@@ -182,27 +183,34 @@ export async function restartDaemonDetached() {
   await removePidFile();
 
   const entry = process.argv[1];
+  const stableCliEntry = fileURLToPath(new URL("../cli.js", import.meta.url));
+  const candidateEntries = [...new Set([stableCliEntry, entry].filter(Boolean))];
   const attempts = [];
-  if (process.platform === "win32" && entry) {
-    attempts.push([process.execPath, [entry, "daemon"]]);
+  if (process.platform === "win32") {
+    for (const cliEntry of candidateEntries) {
+      attempts.push([process.execPath, [cliEntry, "daemon"]]);
+    }
     attempts.push(["codex-feishu", ["daemon"]]);
   } else {
     attempts.push(["codex-feishu", ["daemon"]]);
-    if (entry) {
-      attempts.push([process.execPath, [entry, "daemon"]]);
+    for (const cliEntry of candidateEntries) {
+      attempts.push([process.execPath, [cliEntry, "daemon"]]);
     }
   }
 
   let startResult = { ok: false, error: "no_start_attempt" };
+  const failedAttempts = [];
   for (const [cmd, args] of attempts) {
     // eslint-disable-next-line no-await-in-loop
     startResult = await trySpawnDetached(cmd, args, logPath);
     if (startResult.ok) {
       break;
     }
+    failedAttempts.push(`${cmd} ${args.join(" ")} => ${startResult.error}`);
   }
   if (!startResult.ok) {
-    throw new Error(`failed to start daemon in background: ${startResult.error}`);
+    const details = failedAttempts.length > 0 ? `; attempts: ${failedAttempts.join(" | ")}` : "";
+    throw new Error(`failed to start daemon in background: ${startResult.error}${details}`);
   }
 
   await writeText(pidPath, `${startResult.pid}\n`);
