@@ -183,8 +183,8 @@ export async function restartDaemonDetached() {
   await removePidFile();
 
   const entry = process.argv[1];
-  const stableCliEntry = fileURLToPath(new URL("../cli.js", import.meta.url));
-  const candidateEntries = [...new Set([stableCliEntry, entry].filter(Boolean))];
+  const stableBinEntry = fileURLToPath(new URL("../../bin/codex-feishu.js", import.meta.url));
+  const candidateEntries = [...new Set([stableBinEntry, entry].filter(Boolean))];
   const attempts = [];
   if (process.platform === "win32") {
     for (const cliEntry of candidateEntries) {
