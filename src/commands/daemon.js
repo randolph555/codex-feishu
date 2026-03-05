@@ -2535,7 +2535,10 @@ function resolveCodexBin(bridgeConfig) {
     return envBin;
   }
   const fallbackBin = typeof process.env.CODEX_BIN === "string" ? process.env.CODEX_BIN.trim() : "";
-  return fallbackBin || "codex";
+  if (fallbackBin) {
+    return fallbackBin;
+  }
+  return process.platform === "win32" ? "codex.cmd" : "codex";
 }
 
 function normalizeApprovalPolicy(raw) {
@@ -2688,14 +2691,32 @@ async function callAppServerApi(app, method, params = {}, timeoutMs = APP_RPC_TI
 function runExecFileCapture(file, args, options = {}) {
   const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : CLI_CAPTURE_TIMEOUT_MS;
   const cwd = options.cwd || process.cwd();
+  const quoteForCmd = (value) => {
+    const text = String(value ?? "");
+    if (text.length === 0) {
+      return '""';
+    }
+    if (!/[\s"&|<>^()]/.test(text)) {
+      return text;
+    }
+    return `"${text.replace(/"/g, '""')}"`;
+  };
+
+  const command = process.platform === "win32"
+    ? [file, ...args].map(quoteForCmd).join(" ")
+    : null;
+  const execTarget = process.platform === "win32" ? "cmd.exe" : file;
+  const execArgs = process.platform === "win32" ? ["/d", "/s", "/c", command] : args;
+
   return new Promise((resolve) => {
     execFile(
-      file,
-      args,
+      execTarget,
+      execArgs,
       {
         cwd,
         env: process.env,
         encoding: "utf8",
+        windowsHide: process.platform === "win32",
         timeout: timeoutMs,
         maxBuffer: CLI_CAPTURE_MAX_BUFFER,
       },
