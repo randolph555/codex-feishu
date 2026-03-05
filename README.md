@@ -21,11 +21,31 @@ Codex remote access, straight from Feishu. Use Codex from terminal or Feishu wit
 
 Feishu side experience snapshots:
 
-![Feishu session status card](docs/assets/feishu-preview-session.png)
-
-![Feishu image + reply flow](docs/assets/feishu-preview-image-reply.png)
-
-![Feishu image + reply flow1](docs/assets/feishu-preview-image-reply1.jpg)
+<table>
+  <tr>
+    <td align="center">
+      <a href="docs/assets/feishu-preview-session.png">
+        <img src="docs/assets/feishu-preview-session.png" alt="Feishu session status card" width="240" />
+      </a>
+      <br />
+      Session status
+    </td>
+    <td align="center">
+      <a href="docs/assets/feishu-preview-image-reply.png">
+        <img src="docs/assets/feishu-preview-image-reply.png" alt="Feishu image and reply flow" width="240" />
+      </a>
+      <br />
+      Image + reply flow
+    </td>
+    <td align="center">
+      <a href="docs/assets/feishu-preview-image-reply1.jpg">
+        <img src="docs/assets/feishu-preview-image-reply1.jpg" alt="Feishu image and reply flow variant" width="240" />
+      </a>
+      <br />
+      Image + reply flow v2
+    </td>
+  </tr>
+</table>
 
 
 ## Install
