@@ -4884,6 +4884,27 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
     }
 
     const stopped = await app.stopTurn(threadId, turnId, { timeoutMs: 10_000 });
+    if (!stopped?.ok || !stopped?.stopped) {
+      let explain = "当前会话没有可中断的正在生成任务。";
+      if (stopped?.reason === "targeted_cancel_not_supported_in_proto") {
+        explain = "当前为 proto 模式且存在其它会话正在生成，无法只中断本会话。";
+      } else if (stopped?.reason === "no_active_turn_for_thread") {
+        explain = "当前会话没有正在生成的回复。";
+      }
+      return {
+        ok: false,
+        stopped: false,
+        thread_id: threadId,
+        stop_mode: stopped?.mode ?? null,
+        stop_reason: stopped?.reason ?? null,
+        reply_text: explain,
+        reply_card: {
+          title: "会话状态",
+          template: "orange",
+          markdown: `${explain}\n- 会话ID ${threadId}`,
+        },
+      };
+    }
     await store.mutate((state) => {
       const buffer = ensureThreadBuffer(state, threadId);
       if (buffer) {

@@ -698,8 +698,11 @@ export class AppServerClient extends EventEmitter {
     await this.ensureStarted();
 
     if (this.protocolMode === "proto") {
-      const hadActive = this.activeTurns.size > 0;
-      if (!hadActive && !turnId) {
+      const activeEntries = [...this.activeTurns.entries()].map(([id, meta]) => ({
+        id,
+        threadId: meta?.threadId ?? null,
+      }));
+      if (activeEntries.length === 0) {
         return {
           ok: false,
           stopped: false,
@@ -707,6 +710,34 @@ export class AppServerClient extends EventEmitter {
           reason: "no_active_turn",
         };
       }
+
+      let matched = activeEntries;
+      if (turnId) {
+        matched = activeEntries.filter((item) => item.id === turnId);
+      } else if (threadId) {
+        matched = activeEntries.filter((item) => item.threadId === threadId);
+      }
+      if (matched.length === 0) {
+        return {
+          ok: false,
+          stopped: false,
+          mode: "proto",
+          reason: "no_active_turn_for_thread",
+        };
+      }
+
+      const hasNonMatched = activeEntries.some(
+        (item) => !matched.some((m) => m.id === item.id),
+      );
+      if (hasNonMatched) {
+        return {
+          ok: false,
+          stopped: false,
+          mode: "proto",
+          reason: "targeted_cancel_not_supported_in_proto",
+        };
+      }
+
       await this.stop();
       await this.ensureStarted();
       return {
