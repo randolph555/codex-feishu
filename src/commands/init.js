@@ -1,5 +1,6 @@
 import path from "node:path";
 import fs from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import { ensureDir, readJsonIfExists, readTextIfExists, writeText } from "../lib/fs_utils.js";
 import { getBridgeConfigPath, getBridgeHome, getCodexConfigPath, getPromptsDir } from "../lib/paths.js";
 
@@ -29,6 +30,28 @@ function buildBridgeConfig(flags, existing = {}) {
       "",
     event_mode: "long_connection",
   };
+}
+
+function detectWindowsCodexBin() {
+  if (process.platform !== "win32") {
+    return "";
+  }
+  const tryWhere = (name) => {
+    try {
+      const output = execFileSync("where.exe", [name], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      const lines = output
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+      return lines[0] || "";
+    } catch {
+      return "";
+    }
+  };
+  return tryWhere("codex.cmd") || tryWhere("codex.exe") || tryWhere("codex");
 }
 
 async function readJsonSafe(response) {
@@ -157,6 +180,13 @@ async function writeBridgeConfig(bridgeConfig) {
 export async function runInit(flags, options = {}) {
   const existingBridgeConfig = (await readJsonIfExists(getBridgeConfigPath())) ?? {};
   const bridgeConfig = buildBridgeConfig(flags, existingBridgeConfig);
+  let autoDetectedCodexBin = "";
+  if (!bridgeConfig.codex_bin && process.platform === "win32") {
+    autoDetectedCodexBin = detectWindowsCodexBin();
+    if (autoDetectedCodexBin) {
+      bridgeConfig.codex_bin = autoDetectedCodexBin;
+    }
+  }
   const hasManualBotOpenId =
     Boolean(flags["bot-open-id"] && flags["bot-open-id"].trim()) ||
     Boolean(process.env.FEISHU_BOT_OPEN_ID && process.env.FEISHU_BOT_OPEN_ID.trim());
@@ -180,6 +210,10 @@ export async function runInit(flags, options = {}) {
   console.log(`- Bridge config: ${bridgeConfigPath}`);
   // eslint-disable-next-line no-console
   console.log(`- codex_bin: ${bridgeConfig.codex_bin ? bridgeConfig.codex_bin : "(default: codex in PATH)"}`);
+  if (autoDetectedCodexBin) {
+    // eslint-disable-next-line no-console
+    console.log(`- codex_bin auto-detected: ${autoDetectedCodexBin}`);
+  }
 
   if (!bridgeConfig.app_id || !bridgeConfig.app_secret) {
     // eslint-disable-next-line no-console

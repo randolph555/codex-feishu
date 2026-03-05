@@ -9,7 +9,16 @@ import { callJsonRpc } from "../lib/uds_rpc.js";
 
 function checkCommand(cmd, args = ["--version"]) {
   try {
-    const output = execFileSync(cmd, args, { encoding: "utf8" }).trim();
+    let output = "";
+    if (process.platform === "win32") {
+      const commandLine = [cmd, ...args]
+        .map((item) => String(item))
+        .map((item) => (/\s/.test(item) ? `"${item.replace(/"/g, '""')}"` : item))
+        .join(" ");
+      output = execFileSync("cmd.exe", ["/d", "/s", "/c", commandLine], { encoding: "utf8" }).trim();
+    } else {
+      output = execFileSync(cmd, args, { encoding: "utf8" }).trim();
+    }
     return { ok: true, output };
   } catch {
     return { ok: false, output: "" };

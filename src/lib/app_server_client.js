@@ -46,6 +46,7 @@ function spawnCodex(codexBin, args, options = {}) {
   const spawnOptions = {
     ...options,
     cwd: sanitizeSpawnCwd(options.cwd),
+    windowsHide: process.platform === "win32",
   };
   if (process.platform !== "win32") {
     return spawn(bin, args, spawnOptions);

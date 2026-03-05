@@ -97,6 +97,17 @@ function formatInShanghai(value) {
   return `${y}-${mon}-${d} ${h}:${min}:${s}`;
 }
 
+function quoteForCmd(arg) {
+  const text = String(arg ?? "");
+  if (text.length === 0) {
+    return '""';
+  }
+  if (!/[\s"&|<>^()]/.test(text)) {
+    return text;
+  }
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
 async function renderAsciiQr(value) {
   try {
     const mod = await import("qrcode");
@@ -120,9 +131,14 @@ async function maybeAutostartDaemon() {
 
   const trySpawn = (cmd, args) =>
     new Promise((resolve) => {
-      const child = spawn(cmd, args, {
+      const spawnCmd = process.platform === "win32" ? "cmd.exe" : cmd;
+      const spawnArgs = process.platform === "win32"
+        ? ["/d", "/s", "/c", [cmd, ...args].map(quoteForCmd).join(" ")]
+        : args;
+      const child = spawn(spawnCmd, spawnArgs, {
         detached: true,
         stdio: "ignore",
+        windowsHide: process.platform === "win32",
       });
       child.once("error", () => resolve(false));
       child.once("spawn", () => {

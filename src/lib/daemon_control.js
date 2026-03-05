@@ -144,6 +144,7 @@ async function trySpawnDetached(cmd, args, logPath) {
     detached: true,
     stdio: ["ignore", fd, fd],
     env: process.env,
+    windowsHide: true,
   });
 
   return await new Promise((resolve) => {

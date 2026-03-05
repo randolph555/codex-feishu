@@ -10,6 +10,17 @@ function isTruthy(value) {
   return lowered === "" || lowered === "1" || lowered === "true" || lowered === "yes" || lowered === "on";
 }
 
+function quoteForCmd(arg) {
+  const text = String(arg ?? "");
+  if (text.length === 0) {
+    return '""';
+  }
+  if (!/[\s"&|<>^()]/.test(text)) {
+    return text;
+  }
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
 function formatInShanghai(value) {
   const date = new Date(value);
   if (!Number.isFinite(date.getTime())) {
@@ -46,9 +57,14 @@ async function maybeAutostartDaemon() {
 
   const trySpawn = (cmd, args) =>
     new Promise((resolve) => {
-      const child = spawn(cmd, args, {
+      const spawnCmd = process.platform === "win32" ? "cmd.exe" : cmd;
+      const spawnArgs = process.platform === "win32"
+        ? ["/d", "/s", "/c", [cmd, ...args].map(quoteForCmd).join(" ")]
+        : args;
+      const child = spawn(spawnCmd, spawnArgs, {
         detached: true,
         stdio: "ignore",
+        windowsHide: process.platform === "win32",
       });
       child.once("error", () => resolve(false));
       child.once("spawn", () => {
