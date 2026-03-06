@@ -74,6 +74,12 @@ Refresh bind payload anytime:
 codex-feishu qrcode
 ```
 
+Codex-side trigger after `init`:
+
+```text
+/prompts:feishu-qrcode
+```
+
 ## Quick start (Windows)
 
 ```powershell
@@ -101,6 +107,8 @@ codex
 - `codex-feishu init [flags] [daemon|--daemon]`
 - `codex-feishu doctor`
 - `codex-feishu daemon`
+- `codex-feishu down`
+- `codex-feishu uninstall`
 - `codex-feishu qrcode [--purpose <text>] [--ascii] [--json]`
 - `codex-feishu inbound --chat-id <id> --text <msg> [--user-id <id>]`
 - `codex-feishu mcp` (internal MCP entry, normally no manual use)
@@ -161,4 +169,5 @@ Approval responses:
 ## Architecture and plan
 
 - Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- Thin bridge redesign: [docs/THIN_BRIDGE_ARCHITECTURE.md](docs/THIN_BRIDGE_ARCHITECTURE.md)
 - Priority plan: [docs/PRIORITY_PLAN.md](docs/PRIORITY_PLAN.md)

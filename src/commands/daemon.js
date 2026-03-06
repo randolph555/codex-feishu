@@ -2,7 +2,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 import path from "node:path";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { AppServerClient } from "../lib/app_server_client.js";
 import { FeishuBridge } from "../lib/feishu_bridge.js";
 import { readJsonIfExists, readTextIfExists } from "../lib/fs_utils.js";
@@ -25,6 +25,8 @@ const PENDING_TIMEOUT_MS = 3 * 60 * 1000;
 const IMAGE_DRAFT_WAIT_MS = 90 * 1000;
 const PROGRESS_TIP_ROTATE_MS = 6 * 1000;
 const PROGRESS_TICK_MS = 3 * 1000;
+const INBOUND_MESSAGE_DEDUP_MS = 180 * 1000;
+const INBOUND_MESSAGE_DEDUP_MAX = 4000;
 const APP_RPC_TIMEOUT_MS = 20 * 1000;
 const DEFAULT_PROJECT_DOC_FILENAME = "AGENTS.md";
 const INIT_COMMAND_PROMPT =
@@ -149,7 +151,7 @@ function pickTurnId(params) {
   if (!params || typeof params !== "object") {
     return null;
   }
-  return params.turnId ?? params.turn_id ?? null;
+  return params.turnId ?? params.turn_id ?? params.turn?.id ?? null;
 }
 
 function getBoundChatIdsForThread(state, threadId) {
@@ -652,17 +654,26 @@ function listSwitchableThreads(state, chatId) {
   const binding = chatId ? state.bindings?.[chatId] ?? null : null;
   const activeId = binding?.active_thread_id ?? state.active_thread_id ?? null;
   const ids = new Set();
+  const knownThreadIds = Array.isArray(binding?.known_thread_ids) ? binding.known_thread_ids : [];
   if (activeId) {
     ids.add(activeId);
   }
-  for (const tid of Object.keys(state.thread_buffers ?? {})) {
-    if (tid) {
-      ids.add(tid);
+  if (knownThreadIds.length > 0) {
+    for (const tid of knownThreadIds) {
+      if (typeof tid === "string" && tid.trim()) {
+        ids.add(tid.trim());
+      }
     }
-  }
-  for (const tid of Object.keys(state.thread_titles ?? {})) {
-    if (tid) {
-      ids.add(tid);
+  } else {
+    for (const tid of Object.keys(state.thread_buffers ?? {})) {
+      if (tid) {
+        ids.add(tid);
+      }
+    }
+    for (const tid of Object.keys(state.thread_titles ?? {})) {
+      if (tid) {
+        ids.add(tid);
+      }
     }
   }
   const items = [...ids].map((threadId) => {
@@ -785,7 +796,26 @@ function buildBindingRecord(existing, patch = {}) {
   } else {
     merged.preferred_model = merged.preferred_model.trim();
   }
+  if (typeof merged.current_turn_id !== "string" || !merged.current_turn_id.trim()) {
+    merged.current_turn_id = null;
+  } else {
+    merged.current_turn_id = merged.current_turn_id.trim();
+  }
+  merged.known_thread_ids = uniqueStrings([
+    ...(Array.isArray(merged.known_thread_ids) ? merged.known_thread_ids : []),
+    merged.active_thread_id ?? null,
+  ]).slice(-60);
   return merged;
+}
+
+function updateBindingSession(state, chatId, patch = {}) {
+  if (!chatId) {
+    return null;
+  }
+  const existing = state.bindings?.[chatId] ?? null;
+  const next = buildBindingRecord(existing, patch);
+  state.bindings[chatId] = next;
+  return next;
 }
 
 function progressTipOf(startedAt, now = Date.now()) {
@@ -821,6 +851,10 @@ function completionFooter(threadId, status, buffer, defaultModel = null) {
   if (typeof buffer?.last_progress === "number") {
     lines.push(`- 进度 ${buffer.last_progress.toFixed(0)}%`);
   }
+  const turnAcceptText = formatSeconds(buffer?.turn_accept_ms);
+  if (turnAcceptText) {
+    lines.push(`- 启动耗时 ${turnAcceptText}`);
+  }
   const firstTokenText = formatSeconds(buffer?.first_token_ms);
   if (firstTokenText) {
     lines.push(`- 首字用时 ${firstTokenText}`);
@@ -832,6 +866,49 @@ function completionFooter(threadId, status, buffer, defaultModel = null) {
     lines.push(`- 会话ID ${threadId}`);
   }
   return lines.join("\n");
+}
+
+function createInboundMessageDeduper() {
+  const seen = new Map();
+  const prune = (now) => {
+    for (const [key, expiresAt] of seen.entries()) {
+      if (!Number.isFinite(expiresAt) || expiresAt <= now) {
+        seen.delete(key);
+      }
+    }
+    if (seen.size <= INBOUND_MESSAGE_DEDUP_MAX) {
+      return;
+    }
+    const overflow = seen.size - INBOUND_MESSAGE_DEDUP_MAX;
+    let dropped = 0;
+    for (const key of seen.keys()) {
+      seen.delete(key);
+      dropped += 1;
+      if (dropped >= overflow) {
+        break;
+      }
+    }
+  };
+  return {
+    seen(chatId, messageId) {
+      const chat = typeof chatId === "string" ? chatId.trim() : "";
+      const msg = typeof messageId === "string" ? messageId.trim() : "";
+      if (!chat || !msg) {
+        return false;
+      }
+      const now = Date.now();
+      const key = `${chat}::${msg}`;
+      const expiresAt = seen.get(key);
+      if (Number.isFinite(expiresAt) && expiresAt > now) {
+        return true;
+      }
+      seen.set(key, now + INBOUND_MESSAGE_DEDUP_MS);
+      if (seen.size > INBOUND_MESSAGE_DEDUP_MAX) {
+        prune(now);
+      }
+      return false;
+    },
+  };
 }
 
 function ensureThreadBuffer(state, threadId) {
@@ -849,6 +926,8 @@ function ensureThreadBuffer(state, threadId) {
       last_progress: null,
       last_cwd: null,
       turn_started_at: null,
+      turn_accepted_at: null,
+      turn_accept_ms: null,
       first_token_at: null,
       first_token_ms: null,
       current_turn_id: null,
@@ -978,6 +1057,97 @@ function pickPendingBindInfoForChat(state, chatId) {
   return { code, info };
 }
 
+function looksLikeBridgePromptThread(firstUserMessage) {
+  const text = normalizeReadableText(firstUserMessage ?? "");
+  if (!text) {
+    return false;
+  }
+  return (
+    text.startsWith("Call the `feishu_qrcode` MCP tool.") ||
+    text.startsWith("Reply with exactly:") ||
+    text === "1" ||
+    text === "quit" ||
+    text === "/config"
+  );
+}
+
+function pickLatestCodexThreadHint(cwdHint = null) {
+  const dbPath = path.join(getCodexHome(), "state_5.sqlite");
+  const snapshotDir = path.join(getCodexHome(), "shell_snapshots");
+  let output = "";
+  try {
+    output = execFileSync(
+      "sqlite3",
+      [
+        "-separator",
+        "\x1f",
+        dbPath,
+        "select id, cwd, first_user_message, updated_at from threads where archived = 0 order by updated_at desc limit 50;",
+      ],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    );
+  } catch {
+    return null;
+  }
+  const normalizedCwdHint = normalizeCwdHint(cwdHint ?? null);
+  const candidates = [];
+  for (const line of String(output || "").split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+    const [threadIdRaw, cwdRaw, firstUserMessageRaw, updatedAtRaw] = line.split("\x1f");
+    const threadId = typeof threadIdRaw === "string" ? threadIdRaw.trim() : "";
+    if (!threadId) {
+      continue;
+    }
+    const threadCwd = normalizeCwdHint(cwdRaw ?? null);
+    const firstUserMessage = firstUserMessageRaw ?? "";
+    const updatedAt = Number.parseInt(String(updatedAtRaw ?? "").trim(), 10);
+    const snapshotPath = path.join(snapshotDir, `${threadId}.sh`);
+    let snapshotMtime = 0;
+    try {
+      snapshotMtime = Math.floor(fs.statSync(snapshotPath).mtimeMs / 1000);
+    } catch {
+      snapshotMtime = 0;
+    }
+    candidates.push({
+      threadId,
+      cwd: threadCwd,
+      updatedAt: Number.isFinite(updatedAt) ? updatedAt : 0,
+      snapshotMtime,
+      firstUserMessage,
+    });
+  }
+  if (candidates.length === 0) {
+    return null;
+  }
+  const ranked = [...candidates].sort((a, b) => {
+    if ((b.snapshotMtime || 0) !== (a.snapshotMtime || 0)) {
+      return (b.snapshotMtime || 0) - (a.snapshotMtime || 0);
+    }
+    return (b.updatedAt || 0) - (a.updatedAt || 0);
+  });
+  if (normalizedCwdHint) {
+    const sameCwdRecentSnapshot = ranked.find(
+      (item) => item.cwd === normalizedCwdHint && item.snapshotMtime > 0,
+    );
+    if (sameCwdRecentSnapshot) {
+      return sameCwdRecentSnapshot;
+    }
+    const sameCwd = ranked.find(
+      (item) => item.cwd === normalizedCwdHint && !looksLikeBridgePromptThread(item.firstUserMessage),
+    );
+    if (sameCwd) {
+      return sameCwd;
+    }
+  }
+  const latestSnapshot = ranked.find((item) => item.snapshotMtime > 0);
+  if (latestSnapshot) {
+    return latestSnapshot;
+  }
+  return ranked.find((item) => !looksLikeBridgePromptThread(item.firstUserMessage)) ?? ranked[0] ?? null;
+}
+
 function pickLatestGlobalBindHint(state) {
   const now = Date.now();
   let picked = null;
@@ -1065,15 +1235,6 @@ function pickAutoBindHint(state, chatId) {
       source: "chat_scoped",
     };
   }
-  const globalHint = pickLatestGlobalBindHint(state);
-  if (globalHint) {
-    return {
-      code: globalHint.code,
-      cwdHint: normalizeCwdHint(globalHint.cwd_hint ?? null),
-      threadIdHint: globalHint.thread_id_hint ?? null,
-      source: "global",
-    };
-  }
   return null;
 }
 
@@ -1090,13 +1251,10 @@ function resolveTurnContext(snapshot, chatId, params = {}) {
     }
   }
   const threadBuffer = threadId ? snapshot.thread_buffers?.[threadId] ?? null : null;
-  const cwd = normalizeCwdHint(
-    explicitCwd ??
-      binding?.active_cwd ??
-      threadBuffer?.last_cwd ??
-      snapshot.last_qrcode_cwd ??
-      null,
-  );
+  let cwd = normalizeCwdHint(explicitCwd ?? binding?.active_cwd ?? threadBuffer?.last_cwd ?? null);
+  if (!cwd && !chatId) {
+    cwd = normalizeCwdHint(snapshot.last_qrcode_cwd ?? null);
+  }
   return {
     binding,
     threadId: threadId ?? null,
@@ -1104,11 +1262,11 @@ function resolveTurnContext(snapshot, chatId, params = {}) {
   };
 }
 
-async function appendEvent(store, event) {
+async function appendEvent(store, event, options = {}) {
   await store.mutate((state) => {
     pushRecentEvent(state, event);
     return state;
-  });
+  }, options);
 }
 
 function statusFromState(state, appStatus, feishuStatus, pendingStatus) {
@@ -1158,18 +1316,72 @@ function pickInitialAppCwd(state, bridgeConfig) {
 function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
   const buffers = new Map();
   const timers = new Map();
-  const assistantStreams = new Map();
+  const turnRoutes = new Map();
+  const assistantCards = new Map();
   const terminalCards = new Map();
   const progressCards = new Map();
   const progressTimers = new Map();
-  const FLUSH_MS = 1200;
-  const PROGRESS_FLUSH_MS = 900;
+  const FLUSH_MS = 800;
+  const ASSISTANT_FLUSH_MS = 180;
+  const PROGRESS_FLUSH_MS = 400;
   const TERMINAL_CARD_KEEP_CHARS = 9000;
+  const ASSISTANT_CARD_KEEP_CHARS = 12000;
   const inboundImageDir = path.join(getRunDir(), "inbound-images");
   const outboundImageDir = path.join(getRunDir(), "outbound-images");
   const AUTO_FORWARD_IMAGE_LIMIT = 20;
 
-  const keyOf = (threadId, kind) => `${threadId}::${kind}`;
+  const normalizeRouteRef = (routeRef = {}) => {
+    if (!routeRef || typeof routeRef !== "object") {
+      return { chatId: null, threadId: null, turnId: null };
+    }
+    const chatId = typeof routeRef.chatId === "string" && routeRef.chatId.trim() ? routeRef.chatId.trim() : null;
+    const threadId = typeof routeRef.threadId === "string" && routeRef.threadId.trim() ? routeRef.threadId.trim() : null;
+    const turnId = typeof routeRef.turnId === "string" && routeRef.turnId.trim() ? routeRef.turnId.trim() : null;
+    return { chatId, threadId, turnId };
+  };
+
+  const routeKeyOf = (routeRef = {}) => {
+    const normalized = normalizeRouteRef(routeRef);
+    return normalized.turnId ?? normalized.threadId ?? null;
+  };
+
+  const routeStateKeyOf = (chatId, routeRef, kind = "assistant") => {
+    const routeKey = routeKeyOf(routeRef) ?? "unknown";
+    return `${chatId}::${routeKey}::${kind}`;
+  };
+
+  const registerTurn = (routeRef = {}) => {
+    const normalized = normalizeRouteRef(routeRef);
+    if (!normalized.turnId) {
+      return normalized;
+    }
+    turnRoutes.set(normalized.turnId, normalized);
+    if (turnRoutes.size > 2000) {
+      const oldest = turnRoutes.keys().next();
+      if (!oldest.done) {
+        turnRoutes.delete(oldest.value);
+      }
+    }
+    return normalized;
+  };
+
+  const resolveRoutes = (routeRef = {}) => {
+    const normalized = normalizeRouteRef(routeRef);
+    if (normalized.turnId && turnRoutes.has(normalized.turnId)) {
+      return [turnRoutes.get(normalized.turnId)];
+    }
+    if (normalized.chatId && normalized.threadId) {
+      return [normalized];
+    }
+    if (normalized.threadId) {
+      return getBoundChatIdsForThread(store.snapshot(), normalized.threadId).map((chatId) => ({
+        chatId,
+        threadId: normalized.threadId,
+        turnId: normalized.turnId ?? null,
+      }));
+    }
+    return [];
+  };
 
   const cardTitleOf = (kind) => {
     if (kind === "command") {
@@ -1200,15 +1412,124 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
     return body;
   };
 
-  const terminalCardKeyOf = (chatId, threadId, kind) => `${chatId}::${threadId}::${kind}`;
+  const ensureAssistantCardState = (routeRef) => {
+    const normalized = normalizeRouteRef(routeRef);
+    if (!normalized.chatId) {
+      return null;
+    }
+    const key = routeStateKeyOf(normalized.chatId, normalized, "assistant");
+    let state = assistantCards.get(key);
+    if (!state) {
+      state = {
+        chat_id: normalized.chatId,
+        thread_id: normalized.threadId,
+        turn_id: normalized.turnId,
+        message_id: null,
+        full_text: "",
+        truncated: false,
+        last_markdown: "",
+        last_note: "",
+        footer: "",
+        completed: false,
+      };
+      assistantCards.set(key, state);
+    }
+    return state;
+  };
 
-  const ensureTerminalCardState = (chatId, threadId, kind) => {
-    const key = terminalCardKeyOf(chatId, threadId, kind);
+  const renderAssistantMarkdown = (state) => {
+    const body = normalizeReadableText(state?.full_text ?? "");
+    const footer = normalizeReadableText(state?.footer ?? "");
+    if (body && footer) {
+      return `${body}\n\n---\n${footer}`;
+    }
+    if (body) {
+      return body;
+    }
+    if (footer) {
+      return footer;
+    }
+    return "⏳ 正在生成…";
+  };
+
+  const updateAssistantCard = async (routeRef, payloadText = "", options = {}) => {
+    const state = ensureAssistantCardState(routeRef);
+    if (!state) {
+      return false;
+    }
+    if (payloadText) {
+      state.full_text += payloadText;
+      if (state.full_text.length > ASSISTANT_CARD_KEEP_CHARS) {
+        state.full_text = state.full_text.slice(-ASSISTANT_CARD_KEEP_CHARS);
+        state.truncated = true;
+      }
+    }
+    if (typeof options.footer === "string") {
+      state.footer = options.footer;
+    }
+    if (options.completed === true) {
+      state.completed = true;
+    }
+    const markdown = renderAssistantMarkdown(state);
+    const noteParts = [];
+    if (state.truncated) {
+      noteParts.push(`仅显示最近 ${ASSISTANT_CARD_KEEP_CHARS} 个字符，较早内容已折叠。`);
+    }
+    if (!state.completed) {
+      noteParts.push("持续流式更新中…");
+    }
+    const note = noteParts.join("\n");
+    if (markdown === state.last_markdown && note === state.last_note) {
+      return true;
+    }
+    const payload = {
+      title: cardTitleOf("assistant"),
+      markdown,
+      template: state.completed ? "turquoise" : "blue",
+      note,
+      updatable: true,
+    };
+    try {
+      if (state.message_id) {
+        await feishu.patchMarkdownCard(state.message_id, payload);
+      } else {
+        state.message_id = await feishu.sendMarkdownCard(state.chat_id, payload);
+      }
+      state.last_markdown = markdown;
+      state.last_note = note;
+      return true;
+    } catch (err) {
+      try {
+        state.message_id = await feishu.sendMarkdownCard(state.chat_id, payload);
+        state.last_markdown = markdown;
+        state.last_note = note;
+        return true;
+      } catch (fallbackErr) {
+        await appendEventFn({
+          source: "feishu",
+          type: "assistant_card_update_failed",
+          chat_id: state.chat_id,
+          thread_id: state.thread_id,
+          turn_id: state.turn_id,
+          error: fallbackErr?.message ?? err?.message ?? String(fallbackErr ?? err),
+        });
+        return false;
+      }
+    }
+  };
+
+  const ensureTerminalCardState = (routeRef, kind) => {
+    const normalized = normalizeRouteRef(routeRef);
+    if (!normalized.chatId) {
+      return null;
+    }
+    const key = routeStateKeyOf(normalized.chatId, normalized, kind);
     let state = terminalCards.get(key);
     if (!state) {
       state = {
-        chat_id: chatId,
-        thread_id: threadId,
+        chat_id: normalized.chatId,
+        thread_id: normalized.threadId,
+        turn_id: normalized.turnId,
         kind,
         message_id: null,
         full_text: "",
@@ -1221,8 +1542,11 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
     return state;
   };
 
-  const updateTerminalCard = async (chatId, threadId, kind, payloadText) => {
-    const state = ensureTerminalCardState(chatId, threadId, kind);
+  const updateTerminalCard = async (routeRef, kind, payloadText) => {
+    const state = ensureTerminalCardState(routeRef, kind);
+    if (!state) {
+      return false;
+    }
     state.full_text += payloadText;
     if (state.full_text.length > TERMINAL_CARD_KEEP_CHARS) {
       state.full_text = state.full_text.slice(-TERMINAL_CARD_KEEP_CHARS);
@@ -1249,14 +1573,14 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
       if (state.message_id) {
         await feishu.patchMarkdownCard(state.message_id, payload);
       } else {
-        state.message_id = await feishu.sendMarkdownCard(chatId, payload);
+        state.message_id = await feishu.sendMarkdownCard(state.chat_id, payload);
       }
       state.last_markdown = markdown;
       state.last_note = note;
       return true;
     } catch (err) {
       try {
-        state.message_id = await feishu.sendMarkdownCard(chatId, payload);
+        state.message_id = await feishu.sendMarkdownCard(state.chat_id, payload);
         state.last_markdown = markdown;
         state.last_note = note;
         return true;
@@ -1264,8 +1588,9 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
         await appendEventFn({
           source: "feishu",
           type: "terminal_card_update_failed",
-          chat_id: chatId,
-          thread_id: threadId,
+          chat_id: state.chat_id,
+          thread_id: state.thread_id,
+          turn_id: state.turn_id,
           kind,
           error: fallbackErr?.message ?? err?.message ?? String(fallbackErr ?? err),
         });
@@ -1274,93 +1599,88 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
     }
   };
 
-  const sendToThread = async (threadId, kind, payloadText) => {
-    if (!feishu || !feishu.status().running) {
+  const sendMetaCard = async (routeRef, payloadText) => {
+    const routes = resolveRoutes(routeRef);
+    const markdown = toCardMarkdown("meta", payloadText);
+    if (!markdown) {
       return;
     }
-    const chatIds = getBoundChatIdsForThread(store.snapshot(), threadId);
-    if (chatIds.length === 0) {
-      return;
-    }
-    const markdown = toCardMarkdown(kind, payloadText);
-    const markdownChunks = splitMarkdownChunks(markdown);
-    const textChunks = splitTextChunks(normalizeReadableText(payloadText));
-    for (const chatId of chatIds) {
-      if (kind === "assistant") {
-        const streamKey = `${chatId}::${threadId}`;
-        const stream = assistantStreams.get(streamKey) ?? { fullText: "" };
-        stream.fullText += payloadText;
-        assistantStreams.set(streamKey, stream);
-        continue;
-      }
-      if (kind === "command" || kind === "file") {
-        const updated = await updateTerminalCard(chatId, threadId, kind, payloadText);
-        if (updated) {
-          continue;
-        }
-      }
-      if (markdownChunks.length > 0) {
-        let cardFailed = false;
-        for (const chunk of markdownChunks) {
-          try {
-            await feishu.sendMarkdownCard(chatId, {
-              title: cardTitleOf(kind),
-              markdown: chunk,
-            });
-          } catch (err) {
-            cardFailed = true;
-            await appendEventFn({
-              source: "feishu",
-              type: "send_card_failed",
-              chat_id: chatId,
-              error: err?.message ?? String(err),
-            });
-            break;
-          }
-        }
-        if (!cardFailed) {
-          continue;
-        }
-      }
-      for (const chunk of textChunks) {
-        try {
-          const textPrefix = kind === "assistant" ? "" : `[${kind}] `;
-          await feishu.sendText(chatId, `${textPrefix}${chunk}`);
-        } catch (err) {
-          await appendEventFn({
-            source: "feishu",
-            type: "send_failed",
-            chat_id: chatId,
-            error: err?.message ?? String(err),
-          });
-        }
+    for (const route of routes) {
+      try {
+        await feishu.sendMarkdownCard(route.chatId, {
+          title: cardTitleOf("meta"),
+          markdown,
+          template: "green",
+        });
+      } catch (err) {
+        await appendEventFn({
+          source: "feishu",
+          type: "send_card_failed",
+          chat_id: route.chatId,
+          thread_id: route.threadId,
+          turn_id: route.turnId,
+          error: err?.message ?? String(err),
+        });
       }
     }
   };
 
-  const sendImageToThread = async (threadId, imagePath) => {
+  const sendRoutedPayload = async (routeRef, kind, payloadText) => {
     if (!feishu || !feishu.status().running) {
       return;
     }
-    if (!threadId || !imagePath) {
+    const routes = resolveRoutes(routeRef);
+    if (routes.length === 0) {
+      return;
+    }
+    if (kind === "assistant") {
+      for (const route of routes) {
+        await updateAssistantCard(route, payloadText);
+      }
+      return;
+    }
+    if (kind === "command" || kind === "file") {
+      for (const route of routes) {
+        const updated = await updateTerminalCard(route, kind, payloadText);
+        if (updated) {
+          continue;
+        }
+        const textChunks = splitTextChunks(normalizeReadableText(payloadText));
+        for (const chunk of textChunks) {
+          try {
+            await feishu.sendText(route.chatId, `[${kind}] ${chunk}`);
+          } catch {
+            // noop
+          }
+        }
+      }
+      return;
+    }
+    await sendMetaCard(routeRef, payloadText);
+  };
+
+  const sendImageToRoute = async (routeRef, imagePath) => {
+    if (!feishu || !feishu.status().running) {
+      return;
+    }
+    if (!imagePath || typeof imagePath !== "string") {
       return;
     }
     const resolvedPath = path.resolve(imagePath);
     if (resolvedPath.startsWith(path.resolve(inboundImageDir) + path.sep)) {
       return;
     }
-    const chatIds = getBoundChatIdsForThread(store.snapshot(), threadId);
-    if (chatIds.length === 0) {
-      return;
-    }
-    for (const chatId of chatIds) {
+    const routes = resolveRoutes(routeRef);
+    for (const route of routes) {
       try {
-        await feishu.sendImage(chatId, imagePath);
+        await feishu.sendImage(route.chatId, imagePath);
       } catch (err) {
         await appendEventFn({
           source: "feishu",
           type: "send_image_failed",
-          chat_id: chatId,
+          chat_id: route.chatId,
+          thread_id: route.threadId,
+          turn_id: route.turnId,
           image_path: imagePath,
           error: err?.message ?? String(err),
         });
@@ -1403,7 +1723,9 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
     return filePath;
   };
 
-  const tryForwardImageRefsFromText = async (threadId, text) => {
+  const tryForwardImageRefsFromText = async (routeRef, text) => {
+    const normalized = normalizeRouteRef(routeRef);
+    const threadId = normalized.threadId;
     if (!threadId || !text || !feishu || !feishu.status().running) {
       return;
     }
@@ -1435,11 +1757,13 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
           continue;
         }
         await fsp.access(localPath, fs.constants.R_OK);
-        await sendImageToThread(threadId, localPath);
+        await sendImageToRoute(normalized, localPath);
         await appendEventFn({
           source: "feishu",
           type: "assistant_image_forwarded",
+          chat_id: normalized.chatId,
           thread_id: threadId,
+          turn_id: normalized.turnId,
           image_path: localPath,
           via: "assistant_text_local_path",
         });
@@ -1447,7 +1771,9 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
         await appendEventFn({
           source: "feishu",
           type: "assistant_image_forward_failed",
+          chat_id: normalized.chatId,
           thread_id: threadId,
+          turn_id: normalized.turnId,
           image_path: localPath,
           via: "assistant_text_local_path",
           error: err?.message ?? String(err),
@@ -1459,11 +1785,13 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
       let tmpPath = null;
       try {
         tmpPath = await downloadRemoteImage(remoteUrl);
-        await sendImageToThread(threadId, tmpPath);
+        await sendImageToRoute(normalized, tmpPath);
         await appendEventFn({
           source: "feishu",
           type: "assistant_image_forwarded",
+          chat_id: normalized.chatId,
           thread_id: threadId,
+          turn_id: normalized.turnId,
           image_url: remoteUrl,
           via: "assistant_text_remote_url",
         });
@@ -1471,7 +1799,9 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
         await appendEventFn({
           source: "feishu",
           type: "assistant_image_forward_failed",
+          chat_id: normalized.chatId,
           thread_id: threadId,
+          turn_id: normalized.turnId,
           image_url: remoteUrl,
           via: "assistant_text_remote_url",
           error: err?.message ?? String(err),
@@ -1488,6 +1818,11 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
     }
   };
 
+  const bufferKeyOf = (routeRef, kind) => {
+    const normalized = normalizeRouteRef(routeRef);
+    return `${normalized.threadId ?? "none"}::${normalized.turnId ?? "none"}::${kind}`;
+  };
+
   const flushKey = async (key) => {
     const raw = buffers.get(key);
     buffers.delete(key);
@@ -1499,45 +1834,50 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
     if (!raw || !raw.text) {
       return;
     }
-    const [threadId, kind] = key.split("::");
-    if (!raw.text) {
-      return;
-    }
-    await sendToThread(threadId, kind, raw.text);
+    await sendRoutedPayload(raw.routeRef, raw.kind, raw.text);
   };
 
-  const queue = (threadId, kind, delta) => {
-    if (!threadId || !delta) {
+  const queue = (routeRef, kind, delta) => {
+    const normalized = normalizeRouteRef(routeRef);
+    if (!normalized.threadId || !delta) {
       return;
     }
-    const key = keyOf(threadId, kind);
-    const current = buffers.get(key) ?? { text: "" };
+    const key = bufferKeyOf(normalized, kind);
+    const current = buffers.get(key) ?? { routeRef: normalized, kind, text: "" };
+    current.routeRef = normalized;
+    current.kind = kind;
     current.text += delta;
     buffers.set(key, current);
     if (!timers.has(key)) {
       const timer = setTimeout(() => {
         void flushKey(key);
-      }, kind === "assistant" ? 350 : FLUSH_MS);
+      }, kind === "assistant" ? ASSISTANT_FLUSH_MS : FLUSH_MS);
       timers.set(key, timer);
     }
   };
 
-  const flushThread = async (threadId) => {
-    const keys = [...buffers.keys()].filter((key) => key.startsWith(`${threadId}::`));
+  const flushRoute = async (routeRef) => {
+    const normalized = normalizeRouteRef(routeRef);
+    const keys = [...buffers.keys()].filter((key) => key.startsWith(`${normalized.threadId ?? "none"}::${normalized.turnId ?? "none"}::`));
     for (const key of keys) {
       await flushKey(key);
     }
   };
 
-  const progressKeyOf = (chatId, threadId) => `${chatId}::${threadId}`;
+  const progressKeyOf = (chatId, routeRef) => routeStateKeyOf(chatId, routeRef, "progress");
 
-  const ensureProgressState = (chatId, threadId) => {
-    const key = progressKeyOf(chatId, threadId);
+  const ensureProgressState = (routeRef) => {
+    const normalized = normalizeRouteRef(routeRef);
+    if (!normalized.chatId) {
+      return null;
+    }
+    const key = progressKeyOf(normalized.chatId, normalized);
     let state = progressCards.get(key);
     if (!state) {
       state = {
-        chat_id: chatId,
-        thread_id: threadId,
+        chat_id: normalized.chatId,
+        thread_id: normalized.threadId,
+        turn_id: normalized.turnId,
         started_at: Date.now(),
         steps_started: 0,
         steps_completed: 0,
@@ -1633,12 +1973,14 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
           source: "feishu",
           type: "progress_card_update_failed",
           chat_id: state.chat_id,
+          thread_id: state.thread_id,
+          turn_id: state.turn_id,
           error: fallbackErr?.message ?? err?.message ?? String(fallbackErr ?? err),
         });
       }
     }
 
-    if (progressCards.has(key)) {
+    if (progressCards.has(key) && !state.first_token_seen) {
       scheduleProgressFlush(key, PROGRESS_TICK_MS);
     }
   };
@@ -1653,97 +1995,68 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
     progressTimers.set(key, timer);
   };
 
-  const updateThreadProgress = (threadId, updater) => {
-    if (!threadId || !feishu || !feishu.status().running) {
+  const updateTurnProgress = (routeRef, updater) => {
+    if (!feishu || !feishu.status().running) {
       return;
     }
-    const chatIds = getBoundChatIdsForThread(store.snapshot(), threadId);
-    for (const chatId of chatIds) {
-      const state = ensureProgressState(chatId, threadId);
+    const routes = resolveRoutes(routeRef);
+    for (const route of routes) {
+      const state = ensureProgressState(route);
+      if (!state) {
+        continue;
+      }
       updater(state);
-      scheduleProgressFlush(progressKeyOf(chatId, threadId));
+      scheduleProgressFlush(progressKeyOf(route.chatId, route));
     }
   };
 
-  const onTurnCompleted = async (threadId, status) => {
-    if (!threadId) {
+  const cleanupRoute = (routeRef) => {
+    const routes = resolveRoutes(routeRef);
+    for (const route of routes) {
+      const progressKey = progressKeyOf(route.chatId, route);
+      const timer = progressTimers.get(progressKey);
+      if (timer) {
+        clearTimeout(timer);
+        progressTimers.delete(progressKey);
+      }
+      progressCards.delete(progressKey);
+    }
+  };
+
+  const onTurnCompleted = async (routeRef, status) => {
+    const normalized = normalizeRouteRef(routeRef);
+    if (!normalized.threadId) {
       return;
     }
-    await flushThread(threadId);
+    await flushRoute(normalized);
     const snapshotAfterFlush = store.snapshot();
-    const completionBuffer = snapshotAfterFlush.thread_buffers?.[threadId] ?? null;
-    const relatedAssistantStreams = [...assistantStreams.entries()].filter(([key]) =>
-      key.endsWith(`::${threadId}`),
+    const completionBuffer = snapshotAfterFlush.thread_buffers?.[normalized.threadId] ?? null;
+    const footer = completionFooter(
+      normalized.threadId,
+      status,
+      completionBuffer,
+      runtime.defaultModel ?? null,
     );
+    const routes = resolveRoutes(normalized);
     let imageForwardSourceText = "";
-    for (const [key, stream] of relatedAssistantStreams) {
-      if (!stream?.fullText) {
-        continue;
+    for (const route of routes) {
+      const assistantState = ensureAssistantCardState(route);
+      const assistantText = typeof assistantState?.full_text === "string" ? assistantState.full_text : "";
+      const fallbackAssistantText = typeof completionBuffer?.assistant_text === "string" ? completionBuffer.assistant_text : "";
+      const imageSourceText = assistantText || fallbackAssistantText;
+      if (!imageForwardSourceText && imageSourceText) {
+        imageForwardSourceText = imageSourceText;
       }
-      if (!imageForwardSourceText) {
-        imageForwardSourceText = stream.fullText;
-      }
-      const [chatId] = key.split("::");
-      const rendered = toCardMarkdown("assistant", stream.fullText);
-      const oneShot = rendered.length > 12000 ? `${rendered.slice(0, 11900)}\n\n...(内容较长，已截断)` : rendered;
-      let sent = false;
-      try {
-        await feishu.sendMarkdownCard(chatId, {
-          title: cardTitleOf("assistant"),
-          markdown: oneShot,
-        });
-        sent = true;
-      } catch (err) {
-        await appendEventFn({
-          source: "feishu",
-          type: "assistant_final_send_failed",
-          chat_id: chatId,
-          error: err?.message ?? String(err),
-        });
-      }
-      if (!sent) {
-        const fallback = splitTextChunks(normalizeReadableText(stream.fullText));
-        for (const chunk of fallback) {
-          try {
-            await feishu.sendText(chatId, chunk);
-          } catch {
-            // noop
-          }
-        }
+      if (assistantText || fallbackAssistantText) {
+        await updateAssistantCard(route, assistantText ? "" : fallbackAssistantText, { footer, completed: true });
+      } else {
+        await sendMetaCard(route, footer);
       }
     }
-    const fallbackAssistantText =
-      typeof completionBuffer?.assistant_text === "string" ? completionBuffer.assistant_text : "";
-    const imageSourceText = imageForwardSourceText || fallbackAssistantText;
-    if (imageSourceText) {
-      await tryForwardImageRefsFromText(threadId, imageSourceText);
+    if (imageForwardSourceText) {
+      await tryForwardImageRefsFromText(normalized, imageForwardSourceText);
     }
-    const buffer = completionBuffer;
-    await sendToThread(
-      threadId,
-      "meta",
-      completionFooter(threadId, status, buffer, runtime.defaultModel ?? null),
-    );
-    for (const key of [...assistantStreams.keys()]) {
-      if (key.endsWith(`::${threadId}`)) {
-        assistantStreams.delete(key);
-      }
-    }
-    for (const key of [...terminalCards.keys()]) {
-      if (key.includes(`::${threadId}::`)) {
-        terminalCards.delete(key);
-      }
-    }
-    for (const key of [...progressCards.keys()]) {
-      if (key.endsWith(`::${threadId}`)) {
-        const timer = progressTimers.get(key);
-        if (timer) {
-          clearTimeout(timer);
-          progressTimers.delete(key);
-        }
-        progressCards.delete(key);
-      }
-    }
+    cleanupRoute(normalized);
   };
 
   const shutdown = () => {
@@ -1756,49 +2069,54 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
     timers.clear();
     progressTimers.clear();
     buffers.clear();
-    assistantStreams.clear();
+    assistantCards.clear();
     terminalCards.clear();
     progressCards.clear();
+    turnRoutes.clear();
   };
 
   return {
+    registerTurn,
+    resolveRoutes,
     queue,
     onTurnCompleted,
-    onTurnQueued: (threadId) =>
-      updateThreadProgress(threadId, () => {
+    onTurnQueued: (routeRef) => {
+      const normalized = registerTurn(routeRef);
+      updateTurnProgress(normalized, () => {
         // ensure status card appears immediately, even before first stream delta
-      }),
-    onStepStarted: (threadId) =>
-      updateThreadProgress(threadId, (state) => {
+      });
+    },
+    onStepStarted: (routeRef) =>
+      updateTurnProgress(routeRef, (state) => {
         state.steps_started += 1;
       }),
-    onStepCompleted: (threadId) =>
-      updateThreadProgress(threadId, (state) => {
+    onStepCompleted: (routeRef) =>
+      updateTurnProgress(routeRef, (state) => {
         state.steps_completed += 1;
       }),
-    onSearchStarted: (threadId, meta = {}) =>
-      updateThreadProgress(threadId, (state) => {
+    onSearchStarted: (routeRef, meta = {}) =>
+      updateTurnProgress(routeRef, (state) => {
         state.searches_started += 1;
         state.searches_active += 1;
         if (meta.search_ref) {
           state.latest_search = meta.search_ref;
         }
       }),
-    onSearchCompleted: (threadId, meta = {}) =>
-      updateThreadProgress(threadId, (state) => {
+    onSearchCompleted: (routeRef, meta = {}) =>
+      updateTurnProgress(routeRef, (state) => {
         state.searches_completed += 1;
         state.searches_active = Math.max(0, state.searches_active - 1);
         if (meta.search_ref) {
           state.latest_search = meta.search_ref;
         }
       }),
-    onFirstToken: (threadId) =>
-      updateThreadProgress(threadId, (state) => {
+    onFirstToken: (routeRef) =>
+      updateTurnProgress(routeRef, (state) => {
         if (!state.first_token_seen) {
           state.first_token_seen = true;
         }
       }),
-    sendImage: sendImageToThread,
+    sendImage: sendImageToRoute,
     shutdown,
   };
 }
@@ -2892,6 +3210,172 @@ function buildMixedInput(text, imagePaths = []) {
   return input;
 }
 
+function summarizeUserInputParts(parts = []) {
+  if (!Array.isArray(parts) || parts.length === 0) {
+    return "";
+  }
+  const lines = [];
+  for (const part of parts) {
+    if (!part || typeof part !== "object") {
+      continue;
+    }
+    if (part.type === "text" && typeof part.text === "string" && part.text.trim()) {
+      lines.push(part.text.trim());
+      continue;
+    }
+    if ((part.type === "localImage" || part.type === "image") && typeof part.path === "string") {
+      lines.push(`[图片] ${path.basename(part.path)}`);
+    }
+  }
+  return normalizeReadableText(lines.join("\n"));
+}
+
+function summarizeThreadItemForHistory(item) {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+  if (item.type === "userMessage") {
+    const body = summarizeUserInputParts(item.content);
+    return body ? { role: "用户", text: body } : null;
+  }
+  if (item.type === "agentMessage") {
+    const body = normalizeReadableText(item.text ?? "");
+    return body ? { role: "助手", text: body } : null;
+  }
+  if (item.type === "plan") {
+    const body = normalizeReadableText(item.text ?? "");
+    return body ? { role: "计划", text: body } : null;
+  }
+  if (item.type === "reasoning") {
+    const body = normalizeReadableText(
+      [
+        ...(Array.isArray(item.summary) ? item.summary : []),
+        ...(Array.isArray(item.content) ? item.content : []),
+      ].join("\n"),
+    );
+    return body ? { role: "推理", text: body } : null;
+  }
+  if (item.type === "commandExecution") {
+    const command = normalizeReadableText(item.command ?? "");
+    const output = normalizeReadableText(item.aggregatedOutput ?? "");
+    const lines = [];
+    if (command) {
+      lines.push(`命令: ${command}`);
+    }
+    if (output) {
+      lines.push(output.length > 600 ? `${output.slice(0, 600)}\n...(已截断)` : output);
+    }
+    const body = normalizeReadableText(lines.join("\n"));
+    return body ? { role: "终端", text: body } : null;
+  }
+  if (item.type === "mcpToolCall") {
+    return {
+      role: "工具",
+      text: `MCP: ${item.server ?? "unknown"}/${item.tool ?? "unknown"}${item.status ? ` (${item.status})` : ""}`,
+    };
+  }
+  if (item.type === "webSearch") {
+    const query = normalizeReadableText(item.query ?? "");
+    return query ? { role: "搜索", text: query } : null;
+  }
+  if (item.type === "imageView") {
+    return item.path ? { role: "图片", text: path.basename(item.path) } : null;
+  }
+  if (item.type === "enteredReviewMode") {
+    return { role: "系统", text: "进入 Review 模式" };
+  }
+  if (item.type === "exitedReviewMode") {
+    return { role: "系统", text: "退出 Review 模式" };
+  }
+  if (item.type === "contextCompaction") {
+    return { role: "系统", text: "上下文已压缩" };
+  }
+  return null;
+}
+
+function renderThreadHistoryMarkdown(thread, options = {}) {
+  if (!thread || typeof thread !== "object") {
+    return [];
+  }
+  const maxItems = Number.isFinite(options.maxItems) ? Math.max(1, Number(options.maxItems)) : 12;
+  const turns = Array.isArray(thread.turns) ? thread.turns : [];
+  const flat = [];
+  for (const turn of turns) {
+    const items = Array.isArray(turn?.items) ? turn.items : [];
+    for (const item of items) {
+      const summary = summarizeThreadItemForHistory(item);
+      if (summary?.text) {
+        flat.push(summary);
+      }
+    }
+  }
+  const recent = flat.slice(-maxItems);
+  if (recent.length === 0) {
+    const preview = normalizeReadableText(thread.preview ?? "");
+    if (!preview) {
+      return [];
+    }
+    return [`**最近上下文**\n\n> ${preview}`];
+  }
+  const lines = [];
+  lines.push(thread.name ? `**${thread.name}**` : "**最近上下文**");
+  if (thread.cwd) {
+    lines.push(`目录：\`${thread.cwd}\``);
+  }
+  lines.push("");
+  for (const entry of recent) {
+    lines.push(`**${entry.role}**`);
+    lines.push(entry.text);
+    lines.push("");
+  }
+  return splitMarkdownChunks(lines.join("\n").trim(), 3200);
+}
+
+async function syncThreadHistoryToChat(store, app, chatId, threadId, ctx = {}) {
+  if (!chatId || !threadId || !ctx.feishu || !ctx.feishu.status().running) {
+    return { ok: false, skipped: true };
+  }
+  const readCall = await callAppServerApi(
+    app,
+    "thread/read",
+    {
+      threadId,
+      includeTurns: true,
+    },
+    APP_RPC_TIMEOUT_MS,
+  );
+  if (!readCall.ok || readCall.unsupported) {
+    return { ok: false, unsupported: Boolean(readCall.unsupported) };
+  }
+  const thread = readCall.result?.thread ?? null;
+  const chunks = renderThreadHistoryMarkdown(thread, { maxItems: 12 });
+  if (chunks.length === 0) {
+    return { ok: true, empty: true };
+  }
+  let sent = 0;
+  for (const chunk of chunks) {
+    // eslint-disable-next-line no-await-in-loop
+    await ctx.feishu.sendMarkdownCard(chatId, {
+      title: "当前会话",
+      template: "blue",
+      markdown: chunk,
+    });
+    sent += 1;
+  }
+  await appendEvent(
+    store,
+    {
+      source: "daemon",
+      type: "thread_history_synced_to_chat",
+      chat_id: chatId,
+      thread_id: threadId,
+      chunks: sent,
+    },
+    { persist: false },
+  );
+  return { ok: true, chunks: sent };
+}
+
 async function startTurnWithAutoRecoverInput(store, app, threadId, input, chatId, turnParams = {}) {
   const firstThreadId = await ensureThread(store, app, threadId, {
     preferGlobalActive: !chatId,
@@ -2977,6 +3461,7 @@ async function handleAppNotification(store, msg, relay) {
   const isWebSearchEnd = methodText.endsWith("web_search_end");
   const searchRef = isWebSearchBegin || isWebSearchEnd ? formatSearchReference(params) : null;
   let sawFirstToken = false;
+  const routeRef = { threadId, turnId };
 
   await store.mutate((state) => {
     const event = pushRecentEvent(state, {
@@ -3004,6 +3489,13 @@ async function handleAppNotification(store, msg, relay) {
         buffer.last_turn_id = params?.turn?.id ?? turnId ?? null;
         buffer.last_turn_status = params?.turn?.status ?? null;
         buffer.current_turn_id = null;
+        for (const [chatId, binding] of Object.entries(state.bindings ?? {})) {
+          if (binding?.active_thread_id === threadId && binding?.current_turn_id === (turnId ?? null)) {
+            updateBindingSession(state, chatId, {
+              current_turn_id: null,
+            });
+          }
+        }
       }
       if (hints.model) {
         buffer.last_model = hints.model;
@@ -3015,45 +3507,43 @@ async function handleAppNotification(store, msg, relay) {
         buffer.last_progress = hints.progress;
       }
       buffer.last_update_at = Date.now();
-      state.active_thread_id = threadId;
       event.thread_id = threadId;
     }
     return state;
-  });
+  }, { persist: false });
 
   if (threadId && relay) {
     if (method === "item/agentMessage/delta" && typeof params.delta === "string") {
-      relay.queue(threadId, "assistant", params.delta);
+      relay.queue(routeRef, "assistant", params.delta);
       if (sawFirstToken) {
-        relay.onFirstToken(threadId);
+        relay.onFirstToken(routeRef);
       }
     } else if (method === "item/commandExecution/outputDelta" && typeof params.delta === "string") {
-      relay.queue(threadId, "command", params.delta);
+      relay.queue(routeRef, "command", params.delta);
     } else if (method === "item/fileChange/outputDelta" && typeof params.delta === "string") {
-      relay.queue(threadId, "file", params.delta);
+      relay.queue(routeRef, "file", params.delta);
     } else if (method === "item/started") {
-      relay.onStepStarted(threadId);
+      relay.onStepStarted(routeRef);
     } else if (method === "item/completed") {
-      relay.onStepCompleted(threadId);
+      relay.onStepCompleted(routeRef);
       const imagePaths = extractLocalImagePathsFromThreadItem(params?.item);
       for (const imagePath of imagePaths) {
-        await relay.sendImage(threadId, imagePath);
+        await relay.sendImage(routeRef, imagePath);
       }
     } else if (method === "turn/completed") {
-      await relay.onTurnCompleted(threadId, params?.turn?.status ?? null);
+      await relay.onTurnCompleted(routeRef, params?.turn?.status ?? null);
     }
     if (isWebSearchBegin) {
-      relay.onSearchStarted(threadId, { search_ref: searchRef });
+      relay.onSearchStarted(routeRef, { search_ref: searchRef });
     } else if (isWebSearchEnd) {
-      relay.onSearchCompleted(threadId, { search_ref: searchRef });
+      relay.onSearchCompleted(routeRef, { search_ref: searchRef });
     }
   } else if (relay && (isWebSearchBegin || isWebSearchEnd)) {
-    const activeThreadId = store.snapshot().active_thread_id ?? null;
-    if (activeThreadId) {
+    if (turnId) {
       if (isWebSearchBegin) {
-        relay.onSearchStarted(activeThreadId, { search_ref: searchRef });
+        relay.onSearchStarted({ turnId }, { search_ref: searchRef });
       } else if (isWebSearchEnd) {
-        relay.onSearchCompleted(activeThreadId, { search_ref: searchRef });
+        relay.onSearchCompleted({ turnId }, { search_ref: searchRef });
       }
     }
   }
@@ -3111,10 +3601,13 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
     const purpose = params?.purpose ?? null;
     const cwdHint = normalizeCwdHint(params?.cwd_hint ?? params?.cwdHint ?? null);
     const requestedThreadIdHint = params?.thread_id ?? params?.threadId ?? null;
+    const strictThreadHint = Boolean(params?.strict_thread_hint ?? params?.strictThreadHint);
+    const forceNewCode = Boolean(params?.force_new_code ?? params?.forceNewCode);
+    const latestCodexThreadHint = !requestedThreadIdHint && !strictThreadHint ? pickLatestCodexThreadHint(cwdHint) : null;
     let code = null;
     const createdAt = Date.now();
     let expiresAt = createdAt + BIND_CODE_TTL_MS;
-    let threadIdHint = requestedThreadIdHint ?? null;
+    let threadIdHint = requestedThreadIdHint ?? latestCodexThreadHint?.threadId ?? null;
     const botOpenId = (ctx.bridgeConfig?.bot_open_id ?? "").trim();
     const openChatLink = buildChatOpenLink(botOpenId);
     const qrcodeMode = openChatLink ? "open_chat_link" : "bind_command";
@@ -3123,20 +3616,23 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
     await store.mutate((state) => {
       pruneExpiredBindCodes(state);
       if (!threadIdHint) {
-        threadIdHint = state.active_thread_id ?? null;
+        threadIdHint = latestCodexThreadHint?.threadId ?? (strictThreadHint ? null : state.active_thread_id ?? null);
       }
-      const reusableCode = pickReusableGlobalBindCode(state, {
-        purpose,
-        cwdHint,
-        threadIdHint,
-      });
-      if (reusableCode) {
-        const info = getValidBindCodeInfo(state, reusableCode);
-        if (info) {
-          code = reusableCode;
-          expiresAt = info.expires_at ?? expiresAt;
-          threadIdHint = info.thread_id_hint ?? threadIdHint ?? null;
-          reused = true;
+      const allowReuse = !forceNewCode && !strictThreadHint;
+      if (allowReuse) {
+        const reusableCode = pickReusableGlobalBindCode(state, {
+          purpose,
+          cwdHint,
+          threadIdHint,
+        });
+        if (reusableCode) {
+          const info = getValidBindCodeInfo(state, reusableCode);
+          if (info) {
+            code = reusableCode;
+            expiresAt = info.expires_at ?? expiresAt;
+            threadIdHint = info.thread_id_hint ?? threadIdHint ?? null;
+            reused = true;
+          }
         }
       }
       if (!code) {
@@ -3147,6 +3643,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
           purpose,
           cwd_hint: cwdHint,
           thread_id_hint: threadIdHint,
+          strict_thread_hint: strictThreadHint,
         };
       }
       if (cwdHint) {
@@ -3186,6 +3683,8 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
       throw new Error("feishu/bind requires code and chat_id");
     }
 
+    let activeThreadId = null;
+    let activeCwd = null;
     await store.mutate((state) => {
       pruneExpiredBindCodes(state);
       const pendingCode = state.pending_bind_codes[code];
@@ -3193,12 +3692,15 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
         throw new Error("invalid_or_expired_code");
       }
       const existed = state.bindings?.[chatId] ?? null;
-      const activeCwd = normalizeCwdHint(
+      activeCwd = normalizeCwdHint(
         pendingCode.cwd_hint ?? existed?.active_cwd ?? state.last_qrcode_cwd ?? null,
       );
-      const activeThreadId =
-        pendingCode.thread_id_hint ?? existed?.active_thread_id ?? null;
-      state.bindings[chatId] = buildBindingRecord(existed, {
+      if (pendingCode.strict_thread_hint) {
+        activeThreadId = pendingCode.thread_id_hint ?? null;
+      } else {
+        activeThreadId = pendingCode.thread_id_hint ?? existed?.active_thread_id ?? null;
+      }
+      updateBindingSession(state, chatId, {
         chat_id: chatId,
         user_id: userId ?? existed?.user_id ?? null,
         bound_at: Date.now(),
@@ -3215,8 +3717,35 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
       });
       return state;
     });
+    let threadHistoryChunks = [];
+    if (activeThreadId) {
+      try {
+        const readCall = await callAppServerApi(
+          app,
+          "thread/read",
+          {
+            threadId: activeThreadId,
+            includeTurns: true,
+          },
+          APP_RPC_TIMEOUT_MS,
+        );
+        if (readCall.ok && !readCall.unsupported) {
+          threadHistoryChunks = renderThreadHistoryMarkdown(readCall.result?.thread ?? null, { maxItems: 12 });
+        }
+      } catch (err) {
+        await appendEvent(store, {
+          source: "daemon",
+          type: "binding_history_sync_failed",
+          chat_id: chatId,
+          thread_id: activeThreadId,
+          error: err?.message ?? String(err),
+        }, { persist: false });
+      }
+    }
     return {
       ok: true,
+      thread_id: activeThreadId,
+      thread_history_chunks: threadHistoryChunks,
       reply_text: "绑定成功，飞书会话已接入当前 Codex。",
       reply_card: {
         title: "会话状态",
@@ -3229,11 +3758,49 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
   if (method === "feishu/new_thread") {
     const title = typeof params?.title === "string" ? params.title : null;
     const chatId = params?.chat_id || params?.chatId || null;
+    const snapshot = store.snapshot();
+    const binding = chatId ? snapshot.bindings?.[chatId] ?? null : null;
+    const previousThreadId = binding?.active_thread_id ?? null;
+    const previousTurnId =
+      binding?.current_turn_id ??
+      (previousThreadId ? snapshot.thread_buffers?.[previousThreadId]?.current_turn_id ?? null : null);
+    if (previousThreadId) {
+      try {
+        const stopped = await app.stopTurn(previousThreadId, previousTurnId, { timeoutMs: 6_000 });
+        await appendEvent(store, {
+          source: "daemon",
+          type: "previous_thread_stopped_on_new",
+          chat_id: chatId,
+          thread_id: previousThreadId,
+          turn_id: previousTurnId,
+          stop_mode: stopped?.mode ?? null,
+          stop_reason: stopped?.reason ?? null,
+        });
+      } catch (err) {
+        await appendEvent(store, {
+          source: "daemon",
+          type: "previous_thread_stop_failed_on_new",
+          chat_id: chatId,
+          thread_id: previousThreadId,
+          turn_id: previousTurnId,
+          error: err?.message ?? String(err),
+        });
+      }
+      if (ctx.relay && typeof ctx.relay.onTurnCompleted === "function") {
+        await ctx.relay.onTurnCompleted(
+          { chatId, threadId: previousThreadId, turnId: previousTurnId },
+          "cancelled",
+        );
+      }
+    }
     const created = await startNewThread(store, app, title);
     if (chatId) {
       await store.mutate((state) => {
         if (state.bindings[chatId]) {
-          state.bindings[chatId].active_thread_id = created.threadId;
+          updateBindingSession(state, chatId, {
+            active_thread_id: created.threadId,
+            current_turn_id: null,
+          });
           pushRecentEvent(state, {
             source: "daemon",
             type: "binding_thread_switched",
@@ -3825,9 +4392,10 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
       state.active_thread_id = targetThreadId;
       const existed = state.bindings?.[chatId] ?? null;
       if (existed) {
-        state.bindings[chatId] = buildBindingRecord(existed, {
+        updateBindingSession(state, chatId, {
           active_thread_id: targetThreadId,
           active_cwd: resumedCwd ?? existed.active_cwd ?? null,
+          current_turn_id: null,
         });
       }
       const buffer = ensureThreadBuffer(state, targetThreadId);
@@ -3965,9 +4533,10 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
       state.active_thread_id = newThreadId;
       const existed = state.bindings?.[chatId] ?? null;
       if (existed) {
-        state.bindings[chatId] = buildBindingRecord(existed, {
+        updateBindingSession(state, chatId, {
           active_thread_id: newThreadId,
           active_cwd: forkedCwd ?? existed.active_cwd ?? null,
+          current_turn_id: null,
         });
       }
       ensureThreadBuffer(state, newThreadId);
@@ -4071,9 +4640,10 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
       state.active_thread_id = reviewThreadId;
       const existed = state.bindings?.[chatId] ?? null;
       if (existed) {
-        state.bindings[chatId] = buildBindingRecord(existed, {
+        updateBindingSession(state, chatId, {
           active_thread_id: reviewThreadId,
           active_cwd: resolved.cwd ?? existed.active_cwd ?? null,
+          current_turn_id: turnId,
         });
       }
       const buffer = ensureThreadBuffer(state, reviewThreadId);
@@ -4096,7 +4666,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
       return state;
     });
     if (ctx.relay && typeof ctx.relay.onTurnQueued === "function") {
-      ctx.relay.onTurnQueued(reviewThreadId);
+      ctx.relay.onTurnQueued({ chatId, threadId: reviewThreadId, turnId });
     }
 
     return {
@@ -4212,7 +4782,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
         if (!existed) {
           return state;
         }
-        state.bindings[chatId] = buildBindingRecord(existed, {
+        updateBindingSession(state, chatId, {
           preferred_model: rawModel,
         });
         pushRecentEvent(state, {
@@ -4241,7 +4811,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
         if (!existed) {
           return state;
         }
-        state.bindings[chatId] = buildBindingRecord(existed, {
+        updateBindingSession(state, chatId, {
           preferred_model: null,
         });
         pushRecentEvent(state, {
@@ -4350,7 +4920,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
         if (!existed) {
           return state;
         }
-        state.bindings[chatId] = buildBindingRecord(existed, {
+        updateBindingSession(state, chatId, {
           approval_policy: policy,
         });
         pushRecentEvent(state, {
@@ -4379,7 +4949,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
         if (!existed) {
           return state;
         }
-        state.bindings[chatId] = buildBindingRecord(existed, {
+        updateBindingSession(state, chatId, {
           approval_policy: null,
         });
         pushRecentEvent(state, {
@@ -4461,7 +5031,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
         if (!existed) {
           return state;
         }
-        state.bindings[chatId] = buildBindingRecord(existed, {
+        updateBindingSession(state, chatId, {
           sandbox_mode: mode,
         });
         pushRecentEvent(state, {
@@ -4490,7 +5060,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
         if (!existed) {
           return state;
         }
-        state.bindings[chatId] = buildBindingRecord(existed, {
+        updateBindingSession(state, chatId, {
           sandbox_mode: null,
         });
         pushRecentEvent(state, {
@@ -4566,7 +5136,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
       if (!existed) {
         return state;
       }
-      state.bindings[chatId] = buildBindingRecord(existed, {
+      updateBindingSession(state, chatId, {
         plan_mode: planMode,
       });
       pushRecentEvent(state, {
@@ -4661,6 +5231,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
     if (turnOverrides.sandboxPolicy) {
       turnParams.sandboxPolicy = turnOverrides.sandboxPolicy;
     }
+    const turnRequestStartedAt = Date.now();
     const submitResult = await startTurnWithAutoRecover(
       store,
       app,
@@ -4669,6 +5240,8 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
       chatId,
       turnParams,
     );
+    const turnAcceptedAt = Date.now();
+    const turnAcceptMs = Math.max(0, turnAcceptedAt - turnRequestStartedAt);
     const threadId = submitResult.threadId;
     const turnResponse = submitResult.turnResponse;
     const turnId = turnResponse?.turn?.id ?? null;
@@ -4676,7 +5249,9 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
       state.active_thread_id = threadId;
       const buffer = ensureThreadBuffer(state, threadId);
       if (buffer) {
-        buffer.turn_started_at = Date.now();
+        buffer.turn_started_at = turnRequestStartedAt;
+        buffer.turn_accepted_at = turnAcceptedAt;
+        buffer.turn_accept_ms = turnAcceptMs;
         buffer.first_token_at = null;
         buffer.first_token_ms = null;
         buffer.current_turn_id = turnId;
@@ -4685,10 +5260,11 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
         }
       }
       if (chatId && state.bindings[chatId]) {
-        state.bindings[chatId].active_thread_id = threadId;
-        if (activeCwd) {
-          state.bindings[chatId].active_cwd = activeCwd;
-        }
+        updateBindingSession(state, chatId, {
+          active_thread_id: threadId,
+          active_cwd: activeCwd ?? state.bindings[chatId].active_cwd ?? null,
+          current_turn_id: turnId,
+        });
       }
       pushRecentEvent(state, {
         source: "daemon",
@@ -4697,6 +5273,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
         chat_id: chatId,
         preferred_thread_id: preferredThreadId,
         cwd: activeCwd,
+        turn_accept_ms: turnAcceptMs,
         model: turnOverrides.model ?? null,
         approval_policy: turnOverrides.approvalPolicy ?? null,
         sandbox_mode: turnOverrides.sandboxMode ?? null,
@@ -4705,7 +5282,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
       return state;
     });
     if (ctx.relay && typeof ctx.relay.onTurnQueued === "function") {
-      ctx.relay.onTurnQueued(threadId);
+      ctx.relay.onTurnQueued({ chatId, threadId, turnId });
     }
     return {
       ok: true,
@@ -4771,6 +5348,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
     if (turnOverrides.sandboxPolicy) {
       turnParams.sandboxPolicy = turnOverrides.sandboxPolicy;
     }
+    const turnRequestStartedAt = Date.now();
     const submitResult = await startTurnWithAutoRecoverInput(
       store,
       app,
@@ -4779,6 +5357,8 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
       chatId,
       turnParams,
     );
+    const turnAcceptedAt = Date.now();
+    const turnAcceptMs = Math.max(0, turnAcceptedAt - turnRequestStartedAt);
     const threadId = submitResult.threadId;
     const turnResponse = submitResult.turnResponse;
     const turnId = turnResponse?.turn?.id ?? null;
@@ -4786,7 +5366,9 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
       state.active_thread_id = threadId;
       const buffer = ensureThreadBuffer(state, threadId);
       if (buffer) {
-        buffer.turn_started_at = Date.now();
+        buffer.turn_started_at = turnRequestStartedAt;
+        buffer.turn_accepted_at = turnAcceptedAt;
+        buffer.turn_accept_ms = turnAcceptMs;
         buffer.first_token_at = null;
         buffer.first_token_ms = null;
         buffer.current_turn_id = turnId;
@@ -4795,10 +5377,11 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
         }
       }
       if (chatId && state.bindings[chatId]) {
-        state.bindings[chatId].active_thread_id = threadId;
-        if (activeCwd) {
-          state.bindings[chatId].active_cwd = activeCwd;
-        }
+        updateBindingSession(state, chatId, {
+          active_thread_id: threadId,
+          active_cwd: activeCwd ?? state.bindings[chatId].active_cwd ?? null,
+          current_turn_id: turnId,
+        });
       }
       pushRecentEvent(state, {
         source: "daemon",
@@ -4809,6 +5392,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
         has_text: Boolean(text && text.trim()),
         image_count: imagePaths.length,
         cwd: activeCwd,
+        turn_accept_ms: turnAcceptMs,
         model: turnOverrides.model ?? null,
         approval_policy: turnOverrides.approvalPolicy ?? null,
         sandbox_mode: turnOverrides.sandboxMode ?? null,
@@ -4817,7 +5401,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
       return state;
     });
     if (ctx.relay && typeof ctx.relay.onTurnQueued === "function") {
-      ctx.relay.onTurnQueued(threadId);
+      ctx.relay.onTurnQueued({ chatId, threadId, turnId });
     }
     const mixedKind = text && text.trim() && imagePaths.length > 0 ? "image_text" : imagePaths.length > 0 ? "image" : "text";
     const startText =
@@ -4868,7 +5452,12 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
       };
     }
     const threadBuffer = snapshot.thread_buffers?.[threadId] ?? null;
-    const turnId = params?.turn_id ?? params?.turnId ?? threadBuffer?.current_turn_id ?? null;
+    const turnId =
+      params?.turn_id ??
+      params?.turnId ??
+      resolved.binding?.current_turn_id ??
+      threadBuffer?.current_turn_id ??
+      null;
     if (!turnId) {
       return {
         ok: false,
@@ -4915,7 +5504,10 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
         buffer.last_update_at = Date.now();
       }
       if (chatId && state.bindings?.[chatId]) {
-        state.bindings[chatId].active_thread_id = threadId;
+        updateBindingSession(state, chatId, {
+          active_thread_id: threadId,
+          current_turn_id: null,
+        });
       }
       pushRecentEvent(state, {
         source: "daemon",
@@ -4930,7 +5522,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
     });
 
     if (stopped?.mode === "restart" && ctx.relay && typeof ctx.relay.onTurnCompleted === "function") {
-      await ctx.relay.onTurnCompleted(threadId, "cancelled");
+      await ctx.relay.onTurnCompleted({ chatId, threadId, turnId }, "cancelled");
     }
 
     return {
@@ -5020,7 +5612,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
     if (!binding) {
       if (isPrivateChatType(chatType)) {
         await store.mutate((state) => {
-          let activeCwd = normalizeCwdHint(state.last_qrcode_cwd ?? null);
+          let activeCwd = null;
           let activeThreadId = null;
           const bindHint = pickAutoBindHint(state, chatId);
           if (bindHint) {
@@ -5033,7 +5625,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
             delete state.pending_bind_codes[bindHint.code];
           }
           const existed = state.bindings?.[chatId] ?? null;
-          state.bindings[chatId] = buildBindingRecord(existed, {
+          updateBindingSession(state, chatId, {
             chat_id: chatId,
             user_id: userId ?? existed?.user_id ?? null,
             bound_at: Date.now(),
@@ -5519,7 +6111,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
     if (!binding) {
       if (isPrivateChatType(chatType)) {
         await store.mutate((state) => {
-          let activeCwd = normalizeCwdHint(state.last_qrcode_cwd ?? null);
+          let activeCwd = null;
           let activeThreadId = null;
           const bindHint = pickAutoBindHint(state, chatId);
           if (bindHint) {
@@ -5532,7 +6124,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
             delete state.pending_bind_codes[bindHint.code];
           }
           const existed = state.bindings?.[chatId] ?? null;
-          state.bindings[chatId] = buildBindingRecord(existed, {
+          updateBindingSession(state, chatId, {
             chat_id: chatId,
             user_id: userId ?? existed?.user_id ?? null,
             bound_at: Date.now(),
@@ -5632,6 +6224,23 @@ export async function runDaemon() {
     protoCwd: initialAppCwd,
   });
   const inboundImageDrafts = new Map();
+  const inboundDeduper = createInboundMessageDeduper();
+  const inboundByChatQueue = new Map();
+
+  const enqueueInboundByChat = async (chatId, task) => {
+    const key = typeof chatId === "string" && chatId ? chatId : "__unknown_chat__";
+    const prev = inboundByChatQueue.get(key) ?? Promise.resolve();
+    const next = prev.catch(() => undefined).then(task);
+    inboundByChatQueue.set(
+      key,
+      next.finally(() => {
+        if (inboundByChatQueue.get(key) === next) {
+          inboundByChatQueue.delete(key);
+        }
+      }),
+    );
+    return next;
+  };
 
   const clearImageDraft = (chatId) => {
     const entry = inboundImageDrafts.get(chatId);
@@ -5736,6 +6345,20 @@ export async function runDaemon() {
         await feishu.sendText(chatId, text);
       }
     }
+    if (Array.isArray(result?.thread_history_chunks) && result.thread_history_chunks.length > 0) {
+      for (const chunk of result.thread_history_chunks) {
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          await feishu.sendMarkdownCard(chatId, {
+            title: "当前会话",
+            template: "blue",
+            markdown: chunk,
+          });
+        } catch {
+          // noop
+        }
+      }
+    }
   };
 
   const submitImageDraft = async (chatId, opts = {}) => {
@@ -5773,179 +6396,190 @@ export async function runDaemon() {
         });
       },
       onMessage: async (message) => {
-        try {
-          const inboundType = String(message?.messageType ?? "text").toLowerCase();
-          if (inboundType !== "text" && inboundType !== "image") {
-            if (inboundType === "file") {
-              await feishu.sendMarkdownCard(message.chatId, {
-                title: "会话状态",
-                template: "grey",
-                markdown: "暂不支持文件直传到 Codex，请先在终端里提供文件路径后再处理。",
-              });
-            }
-            return;
-          }
-          if (inboundType === "image") {
-            const result = await handleRpcCall(
-              store,
-              app,
-              "feishu/inbound_image",
-              {
+        await enqueueInboundByChat(message?.chatId, async () => {
+          try {
+            if (inboundDeduper.seen(message.chatId, message.messageId)) {
+              await appendEvent(store, {
+                source: "feishu",
+                type: "inbound_message_duplicate_ignored",
                 chat_id: message.chatId,
-                user_id: message.userId,
-                chat_type: message.chatType,
-                message_id: message.messageId,
-                image_key: message.imageKey,
-                defer: true,
-              },
-              { feishu, pending, runtime, relay },
-            );
-            if (result?.image_path) {
-              const count = stageImageDraft(message.chatId, result.image_path, message);
+                message_id: message.messageId ?? null,
+              }, { persist: false });
+              return;
+            }
+            const inboundType = String(message?.messageType ?? "text").toLowerCase();
+            if (inboundType !== "text" && inboundType !== "image") {
+              if (inboundType === "file") {
+                await feishu.sendMarkdownCard(message.chatId, {
+                  title: "会话状态",
+                  template: "grey",
+                  markdown: "暂不支持文件直传到 Codex，请先在终端里提供文件路径后再处理。",
+                });
+              }
+              return;
+            }
+            if (inboundType === "image") {
+              const result = await handleRpcCall(
+                store,
+                app,
+                "feishu/inbound_image",
+                {
+                  chat_id: message.chatId,
+                  user_id: message.userId,
+                  chat_type: message.chatType,
+                  message_id: message.messageId,
+                  image_key: message.imageKey,
+                  defer: true,
+                },
+                { feishu, pending, runtime, relay },
+              );
+              if (result?.image_path) {
+                const count = stageImageDraft(message.chatId, result.image_path, message);
+                await feishu.sendMarkdownCard(message.chatId, {
+                  title: "会话状态",
+                  markdown:
+                    `🖼️ 已暂存图片 **${count}** 张\n\n` +
+                    "💡 **Tips**\n" +
+                    "- 直接再发一段文字：自动图文一起提问\n" +
+                    "- 发送 `/send`：只提交图片\n" +
+                    "- 发送 `/clear`：清空图片草稿",
+                  template: "wathet",
+                });
+                return;
+              }
+              await deliverFeishuResult(message.chatId, result);
+              return;
+            }
+
+            const trimmed = String(message?.text ?? "").trim();
+            const normalizedKey = trimmed.toLowerCase().replace(/\s+/g, "");
+            const draft = inboundImageDrafts.get(message.chatId);
+            const isSendAlias = new Set(["发送", "提交", "发出", "send", "确认发送", "确认提交"]).has(normalizedKey);
+            const isClearAlias = new Set(["清空", "取消", "作废", "clear", "清除", "丢弃"]).has(normalizedKey);
+            const isNewAlias = new Set(["新会话", "新建会话", "new", "重开"]).has(normalizedKey);
+            const isRebindAlias = new Set(["重绑", "重新绑定", "rebind"]).has(normalizedKey);
+            const isHelpAlias = new Set(["帮助", "菜单", "help"]).has(normalizedKey);
+            const isPendingAlias = new Set(["待处理", "pending"]).has(normalizedKey);
+            const isStatusAlias = new Set(["状态", "status"]).has(normalizedKey);
+            const isStopAlias = new Set(["停止", "中断", "打断", "stop"]).has(normalizedKey);
+            const isSkillsAlias = new Set(["skills", "skill", "技能"]).has(normalizedKey);
+            const isMcpAlias = new Set(["mcp"]).has(normalizedKey);
+            const isGroupAlias = new Set(["群聊", "群说明", "group"]).has(normalizedKey);
+            const isResumeAlias = new Set(["恢复会话", "恢复", "resume"]).has(normalizedKey);
+            const isForkAlias = new Set(["分叉会话", "分支会话", "fork"]).has(normalizedKey);
+            const isReviewAlias = new Set(["代码审查", "审查", "review"]).has(normalizedKey);
+            const isCompactAlias = new Set(["压缩会话", "压缩", "compact"]).has(normalizedKey);
+            const isModelAlias = new Set(["模型", "model"]).has(normalizedKey);
+            const isApprovalsAlias = new Set(["审批策略", "审批", "approvals"]).has(normalizedKey);
+            const isPermissionsAlias = new Set(["权限策略", "权限", "permissions"]).has(normalizedKey);
+            const isPlanAlias = new Set(["计划模式", "计划", "plan"]).has(normalizedKey);
+            const isInitAlias = new Set(["初始化", "init"]).has(normalizedKey);
+            let commandText = trimmed;
+            if (isSendAlias && draft && draft.images.length > 0) {
+              commandText = "/send";
+            } else if (isClearAlias && draft && draft.images.length > 0) {
+              commandText = "/clear";
+            } else if (isNewAlias) {
+              commandText = "/new";
+            } else if (isRebindAlias) {
+              commandText = "/rebind";
+            } else if (isHelpAlias) {
+              commandText = "/help";
+            } else if (isPendingAlias) {
+              commandText = "/pending";
+            } else if (isStatusAlias) {
+              commandText = "/status";
+            } else if (isStopAlias) {
+              commandText = "/stop";
+            } else if (isSkillsAlias) {
+              commandText = "/skills";
+            } else if (isMcpAlias) {
+              commandText = "/mcp";
+            } else if (isGroupAlias) {
+              commandText = "/group";
+            } else if (isResumeAlias) {
+              commandText = "/resume";
+            } else if (isForkAlias) {
+              commandText = "/fork";
+            } else if (isReviewAlias) {
+              commandText = "/review";
+            } else if (isCompactAlias) {
+              commandText = "/compact";
+            } else if (isModelAlias) {
+              commandText = "/model";
+            } else if (isApprovalsAlias) {
+              commandText = "/approvals";
+            } else if (isPermissionsAlias) {
+              commandText = "/permissions";
+            } else if (isPlanAlias) {
+              commandText = "/plan";
+            } else if (isInitAlias) {
+              commandText = "/init";
+            }
+
+            if (commandText === "/clear") {
+              clearImageDraft(message.chatId);
               await feishu.sendMarkdownCard(message.chatId, {
                 title: "会话状态",
-                markdown:
-                  `🖼️ 已暂存图片 **${count}** 张\n\n` +
-                  "💡 **Tips**\n" +
-                  "- 直接再发一段文字：自动图文一起提问\n" +
-                  "- 发送 `/send`：只提交图片\n" +
-                  "- 发送 `/clear`：清空图片草稿",
-                template: "wathet",
+                markdown: "🧹 已清空待发送图片。",
+                template: "green",
               });
               return;
             }
+            if (commandText === "/send") {
+              const submitted = await submitImageDraft(message.chatId, {
+                text: null,
+                reason: "manual",
+              });
+              if (!submitted) {
+                await feishu.sendMarkdownCard(message.chatId, {
+                  title: "会话状态",
+                  markdown: "当前没有待发送图片。",
+                  template: "grey",
+                });
+              }
+              return;
+            }
+            if (draft && draft.images.length > 0 && !commandText.startsWith("/")) {
+              await submitImageDraft(message.chatId, {
+                text: message.text,
+                reason: "text_appended",
+              });
+              return;
+            }
+
+            const result = await handleRpcCall(
+              store,
+              app,
+              "feishu/inbound_text",
+              {
+                text: commandText,
+                chat_id: message.chatId,
+                user_id: message.userId,
+                chat_type: message.chatType,
+              },
+              { feishu, pending, runtime, relay },
+            );
             await deliverFeishuResult(message.chatId, result);
-            return;
-          }
-
-          const trimmed = String(message?.text ?? "").trim();
-          const normalizedKey = trimmed.toLowerCase().replace(/\s+/g, "");
-          const draft = inboundImageDrafts.get(message.chatId);
-          const isSendAlias = new Set(["发送", "提交", "发出", "send", "确认发送", "确认提交"]).has(normalizedKey);
-          const isClearAlias = new Set(["清空", "取消", "作废", "clear", "清除", "丢弃"]).has(normalizedKey);
-          const isNewAlias = new Set(["新会话", "新建会话", "new", "重开"]).has(normalizedKey);
-          const isRebindAlias = new Set(["重绑", "重新绑定", "rebind"]).has(normalizedKey);
-          const isHelpAlias = new Set(["帮助", "菜单", "help"]).has(normalizedKey);
-          const isPendingAlias = new Set(["待处理", "pending"]).has(normalizedKey);
-          const isStatusAlias = new Set(["状态", "status"]).has(normalizedKey);
-          const isStopAlias = new Set(["停止", "中断", "打断", "stop"]).has(normalizedKey);
-          const isSkillsAlias = new Set(["skills", "skill", "技能"]).has(normalizedKey);
-          const isMcpAlias = new Set(["mcp"]).has(normalizedKey);
-          const isGroupAlias = new Set(["群聊", "群说明", "group"]).has(normalizedKey);
-          const isResumeAlias = new Set(["恢复会话", "恢复", "resume"]).has(normalizedKey);
-          const isForkAlias = new Set(["分叉会话", "分支会话", "fork"]).has(normalizedKey);
-          const isReviewAlias = new Set(["代码审查", "审查", "review"]).has(normalizedKey);
-          const isCompactAlias = new Set(["压缩会话", "压缩", "compact"]).has(normalizedKey);
-          const isModelAlias = new Set(["模型", "model"]).has(normalizedKey);
-          const isApprovalsAlias = new Set(["审批策略", "审批", "approvals"]).has(normalizedKey);
-          const isPermissionsAlias = new Set(["权限策略", "权限", "permissions"]).has(normalizedKey);
-          const isPlanAlias = new Set(["计划模式", "计划", "plan"]).has(normalizedKey);
-          const isInitAlias = new Set(["初始化", "init"]).has(normalizedKey);
-          let commandText = trimmed;
-          if (isSendAlias && draft && draft.images.length > 0) {
-            commandText = "/send";
-          } else if (isClearAlias && draft && draft.images.length > 0) {
-            commandText = "/clear";
-          } else if (isNewAlias) {
-            commandText = "/new";
-          } else if (isRebindAlias) {
-            commandText = "/rebind";
-          } else if (isHelpAlias) {
-            commandText = "/help";
-          } else if (isPendingAlias) {
-            commandText = "/pending";
-          } else if (isStatusAlias) {
-            commandText = "/status";
-          } else if (isStopAlias) {
-            commandText = "/stop";
-          } else if (isSkillsAlias) {
-            commandText = "/skills";
-          } else if (isMcpAlias) {
-            commandText = "/mcp";
-          } else if (isGroupAlias) {
-            commandText = "/group";
-          } else if (isResumeAlias) {
-            commandText = "/resume";
-          } else if (isForkAlias) {
-            commandText = "/fork";
-          } else if (isReviewAlias) {
-            commandText = "/review";
-          } else if (isCompactAlias) {
-            commandText = "/compact";
-          } else if (isModelAlias) {
-            commandText = "/model";
-          } else if (isApprovalsAlias) {
-            commandText = "/approvals";
-          } else if (isPermissionsAlias) {
-            commandText = "/permissions";
-          } else if (isPlanAlias) {
-            commandText = "/plan";
-          } else if (isInitAlias) {
-            commandText = "/init";
-          }
-
-          if (commandText === "/clear") {
-            clearImageDraft(message.chatId);
-            await feishu.sendMarkdownCard(message.chatId, {
-              title: "会话状态",
-              markdown: "🧹 已清空待发送图片。",
-              template: "green",
+          } catch (err) {
+            await appendEvent(store, {
+              source: "feishu",
+              type: "inbound_handle_failed",
+              chat_id: message.chatId,
+              error: err?.message ?? String(err),
             });
-            return;
-          }
-          if (commandText === "/send") {
-            const submitted = await submitImageDraft(message.chatId, {
-              text: null,
-              reason: "manual",
-            });
-            if (!submitted) {
+            try {
+              const friendly = mapUserFacingError(err);
               await feishu.sendMarkdownCard(message.chatId, {
                 title: "会话状态",
-                markdown: "当前没有待发送图片。",
-                template: "grey",
+                template: "red",
+                markdown: statusMarkdownFromText(friendly),
               });
+            } catch {
+              // noop
             }
-            return;
           }
-          if (draft && draft.images.length > 0 && !commandText.startsWith("/")) {
-            await submitImageDraft(message.chatId, {
-              text: message.text,
-              reason: "text_appended",
-            });
-            return;
-          }
-
-          const result = await handleRpcCall(
-            store,
-            app,
-            "feishu/inbound_text",
-            {
-              text: commandText,
-              chat_id: message.chatId,
-              user_id: message.userId,
-              chat_type: message.chatType,
-            },
-            { feishu, pending, runtime, relay },
-          );
-          await deliverFeishuResult(message.chatId, result);
-        } catch (err) {
-          await appendEvent(store, {
-            source: "feishu",
-            type: "inbound_handle_failed",
-            chat_id: message.chatId,
-            error: err?.message ?? String(err),
-          });
-          try {
-            const friendly = mapUserFacingError(err);
-            await feishu.sendMarkdownCard(message.chatId, {
-              title: "会话状态",
-              template: "red",
-              markdown: statusMarkdownFromText(friendly),
-            });
-          } catch {
-            // noop
-          }
-        }
+        });
       },
     });
   }
@@ -5976,7 +6610,7 @@ export async function runDaemon() {
       source: "app_server",
       type: "stderr",
       line,
-    });
+    }, { persist: false });
   });
   app.on("exit", async (info) => {
     await appendEvent(store, {
@@ -6036,6 +6670,7 @@ export async function runDaemon() {
   const shutdown = async () => {
     server.close(async () => {
       try {
+        await store.flush();
         removePidFileIfOwned(pidPath);
         relay.shutdown();
         await pending.shutdown();

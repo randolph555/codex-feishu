@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { RemoteUiAdapter } from "./remote_ui_adapter.js";
 
 function safeJsonParse(text, fallback = null) {
   try {
@@ -164,8 +165,9 @@ function buildInteractiveCardContent(payload = {}) {
   });
 }
 
-export class FeishuBridge {
+export class FeishuBridge extends RemoteUiAdapter {
   constructor(options) {
+    super();
     this.appId = options.appId;
     this.appSecret = options.appSecret;
     this.onText = options.onText || null;
@@ -176,6 +178,10 @@ export class FeishuBridge {
     this.wsClient = null;
     this.sdk = null;
     this.lastError = null;
+  }
+
+  name() {
+    return "feishu";
   }
 
   status() {
@@ -457,5 +463,17 @@ export class FeishuBridge {
         content,
       },
     });
+  }
+
+  async sendMarkdown(chatId, payload) {
+    return this.sendMarkdownCard(chatId, payload);
+  }
+
+  async patchMessage(messageId, payload) {
+    return this.patchMarkdownCard(messageId, payload);
+  }
+
+  async sendBindHint(chatId, payload) {
+    return this.sendBindCard(chatId, payload);
   }
 }

@@ -47,6 +47,12 @@ Windows 说明：
 codex-feishu qrcode
 ```
 
+在 Codex 会话里也可直接触发：
+
+```text
+/prompts:feishu-qrcode
+```
+
 - 日志文件：`~/.codex-feishu/run/daemon.log`
 - Linux/macOS 实时看日志：`tail -f ~/.codex-feishu/run/daemon.log`
 - Windows 实时看日志：
@@ -127,4 +133,5 @@ codex
 ## 相关文档
 
 - 架构说明：[ARCHITECTURE.md](./ARCHITECTURE.md)
+- 薄桥接重构草案：[THIN_BRIDGE_ARCHITECTURE.md](./THIN_BRIDGE_ARCHITECTURE.md)
 - 迭代清单：[PRIORITY_PLAN.md](./PRIORITY_PLAN.md)

@@ -6,6 +6,7 @@ import {
   getCodexConfigPath,
 } from "../lib/paths.js";
 import { callJsonRpc } from "../lib/uds_rpc.js";
+import { hasManagedMcpBlock } from "../lib/install_config.js";
 
 function checkCommand(cmd, args = ["--version"]) {
   try {
@@ -43,9 +44,7 @@ export async function runDoctor() {
   const bridgeConfigPath = getBridgeConfigPath();
 
   const codexConfig = (await readTextIfExists(codexConfigPath)) ?? "";
-  const mcpConfigured =
-    codexConfig.includes("[mcp_servers.codex_feishu]") &&
-    codexConfig.includes('command = "codex-feishu"');
+  const mcpConfigured = hasManagedMcpBlock(codexConfig);
   const bridgeConfigReady = await existsNonEmpty(bridgeConfigPath);
   const endpoint = getBridgeRpcEndpoint();
   let daemonRunning = false;

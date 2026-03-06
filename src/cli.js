@@ -1,8 +1,10 @@
 import { runDaemon } from "./commands/daemon.js";
+import { runDown } from "./commands/down.js";
 import { runDoctor } from "./commands/doctor.js";
 import { runInbound } from "./commands/inbound.js";
 import { runInit } from "./commands/init.js";
 import { runMcp } from "./commands/mcp.js";
+import { runUninstall } from "./commands/uninstall.js";
 import { fetchQrcode, formatQrcodeSummary, renderAsciiQr, runQrcode } from "./commands/qrcode.js";
 import { restartDaemonDetached } from "./lib/daemon_control.js";
 
@@ -12,6 +14,8 @@ Usage:
   codex-feishu init [--app-id <id>] [--app-secret <secret>] [--bot-open-id <open_id>] [--encrypt-key <key>] [--verify-token <token>] [--codex-bin <path>] [daemon|--daemon]
   codex-feishu doctor
   codex-feishu daemon
+  codex-feishu down
+  codex-feishu uninstall
   codex-feishu qrcode [--purpose <text>] [--ascii] [--json]
   codex-feishu inbound --chat-id <chat_id> --text <message> [--user-id <id>]
   codex-feishu mcp (internal, for Codex MCP server)
@@ -137,6 +141,16 @@ export async function runCli(argv) {
 
   if (cmd === "daemon") {
     await runDaemon(flags);
+    return;
+  }
+
+  if (cmd === "down" || cmd === "stop") {
+    await runDown();
+    return;
+  }
+
+  if (cmd === "uninstall") {
+    await runUninstall();
     return;
   }
 

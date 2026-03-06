@@ -1,7 +1,94 @@
 import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import readline from "node:readline";
 import { getBridgeRpcEndpoint } from "../lib/paths.js";
 import { callJsonRpc } from "../lib/uds_rpc.js";
+
+
+
+function getCodexTuiLogPath() {
+  const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+  return path.join(codexHome, "log", "codex-tui.log");
+}
+
+function extractRecentLogTail(filePath, maxBytes = 256 * 1024) {
+  try {
+    const stat = fs.statSync(filePath);
+    const size = stat.size || 0;
+    const start = Math.max(0, size - maxBytes);
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const length = size - start;
+      const buf = Buffer.alloc(length);
+      fs.readSync(fd, buf, 0, length, start);
+      return buf.toString("utf8");
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return "";
+  }
+}
+
+function findInvokingThreadIdForTool(toolName, purpose = null, lookbackMs = 60_000) {
+  const logPath = getCodexTuiLogPath();
+  const tail = extractRecentLogTail(logPath);
+  if (!tail) {
+    return null;
+  }
+  const lines = tail.split(/\r?\n/).filter(Boolean);
+  const pattern = new RegExp(`session_loop\\{thread_id=([^}]+)\\}.*ToolCall: mcp__codex_feishu__${toolName}\\s+(\\{.*\\})`);
+  const now = Date.now();
+  let best = null;
+  for (const line of lines) {
+    const match = line.match(pattern);
+    if (!match) {
+      continue;
+    }
+    const threadId = match[1] ?? null;
+    const jsonText = match[2] ?? "{}";
+    let parsed = {};
+    try {
+      parsed = JSON.parse(jsonText);
+    } catch {
+      parsed = {};
+    }
+    const lineTsText = line.slice(0, 30).trim();
+    const lineTs = Date.parse(lineTsText);
+    if (Number.isFinite(lineTs) && now - lineTs > lookbackMs) {
+      continue;
+    }
+    const loggedPurpose = typeof parsed?.purpose === "string" ? parsed.purpose : null;
+    if (purpose && loggedPurpose && loggedPurpose !== purpose) {
+      continue;
+    }
+    best = {
+      threadId,
+      loggedPurpose,
+      ts: Number.isFinite(lineTs) ? lineTs : 0,
+    };
+  }
+  return best?.threadId ?? null;
+}
+
+function resolveInvokingThreadForTool(toolName, purpose = null, options = {}) {
+  const lookbackMs = Number.isFinite(options.lookbackMs)
+    ? Math.max(1_000, Number(options.lookbackMs))
+    : 60_000;
+  const threadId = findInvokingThreadIdForTool(toolName, purpose, lookbackMs);
+  if (threadId) {
+    return {
+      threadId,
+      reason: "matched_recent_tool_call",
+    };
+  }
+  return {
+    threadId: null,
+    reason: "no_recent_tool_call_match",
+  };
+}
 
 const TOOLS = [
   {
@@ -189,14 +276,23 @@ async function handleToolCall(id, params) {
   const args = params?.arguments ?? {};
 
   if (toolName === "feishu_qrcode") {
+    const purpose = args.purpose ?? null;
+    const resolution = resolveInvokingThreadForTool("feishu_qrcode", purpose);
     const result = await callDaemon("feishu/qrcode", {
-      purpose: args.purpose ?? null,
+      purpose,
       cwd_hint: process.cwd(),
+      thread_id: resolution.threadId,
+      strict_thread_hint: true,
+      force_new_code: true,
     });
     const asciiQr = await renderAsciiQr(result.qr_text);
     const expireAtShanghai = formatInShanghai(result.expires_at);
+    const resolutionNote = resolution.threadId
+      ? "- note: 已精确绑定到当前触发二维码的 Codex 会话"
+      : `- note: 未能精确识别当前 Codex 会话（${resolution.reason}），因此不会自动绑定到某条会话，避免绑错`;
     const text = [
       "飞书绑定码已生成。",
+      resolutionNote,
       result.reused ? "- note: 本次复用了最近一次未过期绑定码（避免重复调用生成新码）" : "",
       `- code: ${result.code}`,
       `- expire_at(上海): ${expireAtShanghai || "unknown"}`,

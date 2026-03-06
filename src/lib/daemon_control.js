@@ -3,7 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { ensureDir, readTextIfExists, writeText } from "./fs_utils.js";
 import { getBridgeRpcEndpoint, getDaemonLogPath, getDaemonPidPath, getRunDir } from "./paths.js";
-import { callJsonRpc } from "./uds_rpc.js";
+import { callJsonRpc, parseRpcEndpoint } from "./uds_rpc.js";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -266,5 +266,54 @@ export async function restartDaemonDetached() {
     stopResult,
     stopResults,
     startResult,
+  };
+}
+
+export async function stopDaemon() {
+  await ensureDir(getRunDir());
+  const logPath = getDaemonLogPath();
+  const { pidPath, pid } = await readPidFile();
+
+  const stopTargets = new Set([...listDaemonPids(), ...(pid ? [pid] : [])]);
+  const stopResults = [];
+  for (const targetPid of stopTargets) {
+    // eslint-disable-next-line no-await-in-loop
+    const result = await stopByPid(targetPid);
+    stopResults.push(result);
+  }
+
+  let stopResult = { action: "already_stopped", pid: null };
+  if (pid) {
+    const matched = stopResults.find((item) => item.pid === pid);
+    if (matched) {
+      stopResult = matched;
+    }
+  } else if (stopResults.length > 0) {
+    stopResult = { action: "cleaned_stale", pid: null, count: stopResults.length };
+  }
+
+  await removePidFile();
+
+  const endpoint = getBridgeRpcEndpoint();
+  try {
+    const parsed = parseRpcEndpoint(endpoint);
+    if (parsed.kind === "unix") {
+      try {
+        fs.unlinkSync(parsed.path);
+      } catch (err) {
+        if (!err || err.code !== "ENOENT") {
+          throw err;
+        }
+      }
+    }
+  } catch {
+    // noop
+  }
+
+  return {
+    pidPath,
+    logPath,
+    stopResult,
+    stopResults,
   };
 }

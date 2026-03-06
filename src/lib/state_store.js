@@ -4,6 +4,7 @@ import { readTextIfExists, writeJson } from "./fs_utils.js";
 
 const STATE_VERSION = 1;
 const MAX_RECENT_EVENTS = 500;
+const DEFAULT_DEFER_SAVE_MS = 500;
 
 function nowTs() {
   return Date.now();
@@ -67,10 +68,16 @@ function toPersistedState(state) {
 }
 
 export class StateStore {
-  constructor(statePath) {
+  constructor(statePath, options = {}) {
     this.statePath = statePath;
     this.state = defaultState();
     this.queue = Promise.resolve();
+    this.dirty = false;
+    this.deferredSaveTimer = null;
+    this.deferSaveMs =
+      Number.isFinite(options.deferSaveMs) && options.deferSaveMs >= 0
+        ? Number(options.deferSaveMs)
+        : DEFAULT_DEFER_SAVE_MS;
   }
 
   async load() {
@@ -108,9 +115,37 @@ export class StateStore {
   async save() {
     this.state.updated_at = nowTs();
     await writeJson(this.statePath, toPersistedState(this.state));
+    this.dirty = false;
   }
 
-  async mutate(mutator) {
+  scheduleDeferredSave() {
+    if (this.deferredSaveTimer) {
+      return;
+    }
+    this.deferredSaveTimer = setTimeout(() => {
+      this.deferredSaveTimer = null;
+      void this.flush();
+    }, this.deferSaveMs);
+  }
+
+  async flush() {
+    const run = async () => {
+      if (!this.dirty) {
+        return this.state;
+      }
+      await this.save();
+      return this.state;
+    };
+    const next = this.queue.then(run, run);
+    this.queue = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
+  async mutate(mutator, options = {}) {
+    const persist = options?.persist !== false;
     const run = async () => {
       const maybeNext = await mutator(this.state);
       if (maybeNext) {
@@ -118,7 +153,12 @@ export class StateStore {
       } else {
         this.state = normalizeState(this.state);
       }
-      await this.save();
+      if (persist) {
+        await this.save();
+      } else {
+        this.dirty = true;
+        this.scheduleDeferredSave();
+      }
       return this.state;
     };
     const next = this.queue.then(run, run);
