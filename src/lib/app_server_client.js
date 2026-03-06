@@ -199,6 +199,7 @@ export class AppServerClient extends EventEmitter {
     this.protoApprovalPolicy = process.env.CODEX_FEISHU_APPROVAL_POLICY || "on-failure";
     this.protoSandboxMode = process.env.CODEX_FEISHU_SANDBOX_MODE || "workspace-write";
     this.protoSummary = process.env.CODEX_FEISHU_SUMMARY || "auto";
+    this.turnStartTimeoutMs = Number.parseInt(process.env.CODEX_FEISHU_TURN_START_TIMEOUT_MS || "", 10) || 45_000;
 
     this.process = null;
     this.stdoutRl = null;
@@ -666,16 +667,20 @@ export class AppServerClient extends EventEmitter {
     }
 
     if (requestedCwd && requestedCwd !== this.protoCwd) {
+      // Keep local hint aligned, but avoid expensive process restart on every cwd switch.
+      // `turn/start` already carries cwd in params for per-turn execution context.
       this.protoCwd = requestedCwd;
-      await this.stop();
-      await this.ensureStarted();
     }
 
-    return this.request("turn/start", {
-      threadId,
-      input,
-      ...params,
-    });
+    return this.request(
+      "turn/start",
+      {
+        threadId,
+        input,
+        ...params,
+      },
+      this.turnStartTimeoutMs,
+    );
   }
 
   async steerTurn(threadId, expectedTurnId, text) {
