@@ -73,16 +73,6 @@ codex
 - `/stop`：中断当前生成
 - `/pending`：查看当前待审批/待输入项
 
-### 会话与目录
-
-- `/resume [序号|会话ID]`
-- `/fork [序号|会话ID]`
-- `/threads`
-- `/sw <序号|会话ID>`
-- `/cwd`
-- `/cwd <PATH>`
-- `/cwd <PATH> new`
-
 ### Codex 能力桥接
 
 - `/review [说明|branch:<分支>|commit:<sha>]`

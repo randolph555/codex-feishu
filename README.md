@@ -110,15 +110,6 @@ Core:
 - `/stop`: stop current generation
 - `/pending`: list pending approvals/input requests
 
-Session / directory:
-- `/resume [index|thread_id]`
-- `/fork [index|thread_id]`
-- `/threads`
-- `/sw <index|thread_id>`
-- `/cwd`
-- `/cwd <PATH>`
-- `/cwd <PATH> new`
-
 Codex capability bridge:
 - `/review [instructions|branch:<name>|commit:<sha>]`
 - `/compact`
