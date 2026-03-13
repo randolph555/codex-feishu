@@ -74,6 +74,29 @@ function watchLogCommand(logPath) {
   return `tail -f ${logPath}`;
 }
 
+function printDaemonStartSummary(result) {
+  // eslint-disable-next-line no-console
+  console.log("\nDaemon:");
+  // eslint-disable-next-line no-console
+  console.log(
+    `- Previous: ${result.stopResult.action}${
+      result.stopResult.pid ? ` (pid=${result.stopResult.pid})` : ""
+    }`,
+  );
+  // eslint-disable-next-line no-console
+  console.log(`- Started: pid=${result.startResult.pid} (background)`);
+  // eslint-disable-next-line no-console
+  console.log(`- PID file: ${result.pidPath}`);
+  // eslint-disable-next-line no-console
+  console.log(`- Log file: ${result.logPath}`);
+  if (Array.isArray(result.stopResults) && result.stopResults.length > 1) {
+    // eslint-disable-next-line no-console
+    console.log(`- Cleaned stale daemons: ${result.stopResults.length}`);
+  }
+  // eslint-disable-next-line no-console
+  console.log(`- Watch log: ${watchLogCommand(result.logPath)}`);
+}
+
 export async function runCli(argv) {
   const { args, flags } = parseArgs(argv);
   const cmd = args[0] ?? "help";
@@ -90,26 +113,7 @@ export async function runCli(argv) {
     if (startDaemon) {
       const result = await restartDaemonDetached();
       const bindWaitMs = process.platform === "win32" ? 40000 : 20000;
-      // eslint-disable-next-line no-console
-      console.log("\nDaemon:");
-      // eslint-disable-next-line no-console
-      console.log(
-        `- Previous: ${result.stopResult.action}${
-          result.stopResult.pid ? ` (pid=${result.stopResult.pid})` : ""
-        }`,
-      );
-      // eslint-disable-next-line no-console
-      console.log(`- Started: pid=${result.startResult.pid} (background)`);
-      // eslint-disable-next-line no-console
-      console.log(`- PID file: ${result.pidPath}`);
-      // eslint-disable-next-line no-console
-      console.log(`- Log file: ${result.logPath}`);
-      if (Array.isArray(result.stopResults) && result.stopResults.length > 1) {
-        // eslint-disable-next-line no-console
-        console.log(`- Cleaned stale daemons: ${result.stopResults.length}`);
-      }
-      // eslint-disable-next-line no-console
-      console.log(`- Watch log: ${watchLogCommand(result.logPath)}`);
+      printDaemonStartSummary(result);
       // eslint-disable-next-line no-console
       console.log(`- Bind: waiting for daemon readiness (up to ${Math.round(bindWaitMs / 1000)}s)...`);
 
@@ -140,7 +144,12 @@ export async function runCli(argv) {
   }
 
   if (cmd === "daemon") {
-    await runDaemon(flags);
+    if (flags.foreground === "true") {
+      await runDaemon(flags);
+      return;
+    }
+    const result = await restartDaemonDetached();
+    printDaemonStartSummary(result);
     return;
   }
 

@@ -42,6 +42,7 @@ Windows 说明：
 - `init ... daemon` 会自动重启后台 daemon。
 - daemon 按单实例运行；`init ... daemon` 会先停止旧进程，再启动新进程。
 - 私聊/群聊默认自动绑定；二维码/绑定码仅作为备用手段。
+ - 单独执行 `codex-feishu daemon` 也会后台重启（单实例）。
 
 - 日志文件：`~/.codex-feishu/run/daemon.log`
 - Linux/macOS 实时看日志：`tail -f ~/.codex-feishu/run/daemon.log`

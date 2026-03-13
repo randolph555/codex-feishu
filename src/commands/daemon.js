@@ -389,12 +389,20 @@ function buildInboundImagePath(messageId, imageKey) {
 
 function isThreadNotFoundError(err) {
   const msg = String(err?.message ?? "").toLowerCase();
-  if (msg.includes("thread not found") || msg.includes("thread_not_found")) {
+  if (
+    msg.includes("thread not found") ||
+    msg.includes("thread_not_found") ||
+    msg.includes("no rollout found")
+  ) {
     return true;
   }
   if (err?.data) {
     const dataText = String(JSON.stringify(err.data)).toLowerCase();
-    if (dataText.includes("thread not found") || dataText.includes("thread_not_found")) {
+    if (
+      dataText.includes("thread not found") ||
+      dataText.includes("thread_not_found") ||
+      dataText.includes("no rollout found")
+    ) {
       return true;
     }
   }
@@ -3535,8 +3543,8 @@ function groupUsageMarkdown() {
   return [
     "群聊使用说明：",
     "1. 先把机器人加入群聊。",
-    "2. 在群里先发送：`/bind <CODE>` 完成绑定。",
-    "3. 绑定后建议 `@机器人` 再提问（避免群消息策略拦截）。",
+    "2. 群聊默认自动绑定，无需手动 /bind。",
+    "3. 建议 `@机器人` 再提问（避免群消息策略拦截）。",
     "",
     "如果群里完全没响应：",
     "- 检查飞书应用是否开启了群聊消息接收。",
@@ -3555,13 +3563,13 @@ function mapUserFacingError(err) {
     return "绑定码无效或已过期。请发送 `/rebind` 获取新绑定码。";
   }
   if (lower.includes("thread_not_found_rebind")) {
-    return "绑定的会话已失效，请在终端执行 `/prompts:feishu-qrcode` 重新绑定。";
+    return "会话已失效，已尝试自动恢复。请重试；如仍失败发送 `/new`。";
   }
   if (lower.includes("feishu bridge not running")) {
     return "飞书桥接未就绪。请稍后重试；若持续失败，在终端执行 `codex-feishu init daemon`。";
   }
   if (isThreadNotFoundError(err)) {
-    return "会话已失效，请在终端执行 `/prompts:feishu-qrcode` 重新绑定。";
+    return "会话已失效，已尝试自动恢复。请重试；如仍失败发送 `/new`。";
   }
   if (isAppServerExitError(err)) {
     return "Codex 后端连接中断，正在恢复。请稍后重试。";

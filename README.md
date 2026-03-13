@@ -101,6 +101,7 @@ codex
 - `codex-feishu mcp` (internal MCP entry, normally no manual use)
 
 Daemon control:
+- `codex-feishu daemon` : start/restart daemon in background (singleton)
 - `codex-feishu down` : stop/pause the local daemon (bridge stops relaying)
 - `codex-feishu uninstall` : stop daemon and remove managed bridge config
 
