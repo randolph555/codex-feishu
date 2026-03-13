@@ -388,7 +388,7 @@ function buildInboundImagePath(messageId, imageKey) {
 }
 
 function isThreadNotFoundError(err) {
-  const msg = String(err?.message ?? "").toLowerCase();
+  const msg = String(err?.message ?? err ?? "").toLowerCase();
   if (
     msg.includes("thread not found") ||
     msg.includes("thread_not_found") ||
