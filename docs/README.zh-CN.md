@@ -85,6 +85,16 @@ codex
 - `/skills`
 - `/mcp [list|get|add|remove|login|logout] ...`
 
+### 会话与目录
+
+- `/resume [序号|会话ID]`
+- `/fork [序号|会话ID]`（需要 Codex app-server 支持；否则提示不支持）
+- `/threads`
+- `/sw <序号|会话ID>`
+- `/cwd`
+- `/cwd <PATH>`
+- `/cwd <PATH> new`
+
 ### 审批快捷
 
 - 直接回复 `1` / `2` / `3`

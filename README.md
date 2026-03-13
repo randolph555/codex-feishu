@@ -121,6 +121,15 @@ Codex capability bridge:
 - `/skills`
 - `/mcp [list|get|add|remove|login|logout] ...`
 
+Session / directory:
+- `/resume [index|thread_id]`
+- `/fork [index|thread_id]` (requires Codex app-server support; otherwise returns “not supported”)
+- `/threads`
+- `/sw <index|thread_id>`
+- `/cwd`
+- `/cwd <PATH>`
+- `/cwd <PATH> new`
+
 Approval responses:
 - quick reply `1` / `2` / `3`
 - `/approve [pending_id] [session]`
