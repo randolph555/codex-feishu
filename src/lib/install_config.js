@@ -19,6 +19,15 @@ ${CODEX_FEISHU_MARK_END}
 `;
 }
 
+export function hasMcpServerSection(content = "", serverName = "codex_feishu") {
+  const safeName = String(serverName ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (!safeName) {
+    return false;
+  }
+  const pattern = new RegExp(`^\\s*\\[mcp_servers\\.${safeName}\\]\\s*$`, "m");
+  return pattern.test(String(content ?? ""));
+}
+
 export function hasManagedMcpBlock(content = "") {
   return String(content).includes(CODEX_FEISHU_MARK_BEGIN) && String(content).includes(CODEX_FEISHU_MARK_END);
 }
@@ -33,8 +42,12 @@ export function removeManagedMcpBlock(content = "") {
 }
 
 export function upsertManagedMcpBlock(content = "", command = "codex-feishu", args = ["mcp"]) {
+  const raw = String(content ?? "");
+  if (!hasManagedMcpBlock(raw) && hasMcpServerSection(raw, "codex_feishu")) {
+    return raw;
+  }
   const block = buildManagedMcpBlock(command, args);
-  const cleaned = hasManagedMcpBlock(content) ? removeManagedMcpBlock(content) : String(content ?? "");
+  const cleaned = hasManagedMcpBlock(raw) ? removeManagedMcpBlock(raw) : raw;
   const joiner = cleaned.length === 0 || cleaned.endsWith("\n") ? "" : "\n";
   return `${cleaned}${joiner}${cleaned.trim() ? "\n" : ""}${block}`;
 }

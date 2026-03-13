@@ -87,8 +87,8 @@ sequenceDiagram
 
 ### 1) Bind
 
-1. Generate bind payload (`feishu/qrcode`).
-2. User sends `/bind CODE` (or private-chat auto-bind).
+1. Auto-bind on first message (private/group).
+2. Optional fallback: generate bind payload (`feishu/qrcode`).
 3. Daemon stores `chat_id -> thread/cwd` mapping.
 
 ### 2) User message

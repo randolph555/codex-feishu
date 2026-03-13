@@ -7,6 +7,12 @@ import { AppServerClient } from "../lib/app_server_client.js";
 import { FeishuBridge } from "../lib/feishu_bridge.js";
 import { readJsonIfExists, readTextIfExists } from "../lib/fs_utils.js";
 import {
+  SessionTailer,
+  createTextFingerprint,
+  resolveTuiTarget,
+  writeToTty,
+} from "../lib/tui_sync.js";
+import {
   getCodexConfigPath,
   getCodexHome,
   getBridgeConfigPath,
@@ -851,10 +857,6 @@ function completionFooter(threadId, status, buffer, defaultModel = null) {
   if (typeof buffer?.last_progress === "number") {
     lines.push(`- 进度 ${buffer.last_progress.toFixed(0)}%`);
   }
-  const turnAcceptText = formatSeconds(buffer?.turn_accept_ms);
-  if (turnAcceptText) {
-    lines.push(`- 启动耗时 ${turnAcceptText}`);
-  }
   const firstTokenText = formatSeconds(buffer?.first_token_ms);
   if (firstTokenText) {
     lines.push(`- 首字用时 ${firstTokenText}`);
@@ -866,6 +868,235 @@ function completionFooter(threadId, status, buffer, defaultModel = null) {
     lines.push(`- 会话ID ${threadId}`);
   }
   return lines.join("\n");
+}
+
+function sanitizeReasoningSummary(text) {
+  const raw = normalizeReadableText(text);
+  if (!raw) {
+    return "";
+  }
+  const lines = raw.split("\n");
+  const filtered = lines.filter((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      return false;
+    }
+    if (
+      /^(Planning|Retrying|Testing|Considering|Providing|Adding|I'm)\b/i.test(trimmed) &&
+      /(tool|call|search|brows|query|weather|web\.run|function)/i.test(trimmed)
+    ) {
+      return false;
+    }
+    return true;
+  });
+  return filtered.join("\n").trim();
+}
+
+// auto-retry intentionally disabled; user prefers manual control
+
+class TuiMirror {
+  constructor({ store, feishu, bridgeConfig }) {
+    this.store = store;
+    this.feishu = feishu;
+    this.enabled = bridgeConfig?.tui_sync === true;
+    this.tailers = new Map();
+    this.suppressed = new Map();
+  }
+
+  shouldUse() {
+    return this.enabled && this.feishu && this.feishu.status().running;
+  }
+
+  rememberSuppression(chatId, text) {
+    const key = createTextFingerprint(text);
+    if (!key || !chatId) {
+      return;
+    }
+    const now = Date.now();
+    const existing = this.suppressed.get(chatId) ?? [];
+    const next = existing.filter((entry) => now - entry.ts < 60_000);
+    next.push({ key, ts: now });
+    this.suppressed.set(chatId, next.slice(-80));
+  }
+
+  shouldSuppress(chatId, text) {
+    const key = createTextFingerprint(text);
+    if (!key || !chatId) {
+      return false;
+    }
+    const now = Date.now();
+    const entries = this.suppressed.get(chatId) ?? [];
+    const kept = [];
+    let matched = false;
+    for (const entry of entries) {
+      if (now - entry.ts >= 60_000) {
+        continue;
+      }
+      if (!matched && entry.key === key) {
+        matched = true;
+        continue;
+      }
+      kept.push(entry);
+    }
+    this.suppressed.set(chatId, kept);
+    return matched;
+  }
+
+  extractMessageText(payload, role) {
+    const content = Array.isArray(payload?.content) ? payload.content : [];
+    const parts = [];
+    for (const item of content) {
+      if (!item || typeof item !== "object") {
+        continue;
+      }
+      if (role === "assistant" && item.type === "output_text" && typeof item.text === "string") {
+        parts.push(item.text);
+      } else if (role === "user" && item.type === "input_text" && typeof item.text === "string") {
+        parts.push(item.text);
+      }
+    }
+    return parts.join("");
+  }
+
+  async sendAssistantMessage(chatId, text) {
+    if (!this.feishu || !this.feishu.status().running) {
+      return;
+    }
+    const markdown = normalizeReadableText(text);
+    if (!markdown) {
+      return;
+    }
+    const chunks = splitMarkdownChunks(markdown, 3200);
+    for (const chunk of chunks) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        await this.feishu.sendMarkdownCard(chatId, {
+          title: "Codex 回复",
+          template: "turquoise",
+          markdown: chunk,
+        });
+      } catch {
+        // noop
+      }
+    }
+  }
+
+  async sendUserEcho(chatId, text) {
+    if (!this.feishu || !this.feishu.status().running) {
+      return;
+    }
+    const body = normalizeReadableText(text);
+    if (!body) {
+      return;
+    }
+    const chunks = splitTextChunks(body, 1600);
+    for (const chunk of chunks) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        await this.feishu.sendText(chatId, `终端输入: ${chunk}`);
+      } catch {
+        // noop
+      }
+    }
+  }
+
+  handleSessionLine(chatId, threadId, line) {
+    let payload = null;
+    try {
+      payload = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (!payload || payload.type !== "response_item") {
+      return;
+    }
+    const message = payload.payload ?? null;
+    if (!message || message.type !== "message") {
+      return;
+    }
+    const role = message.role;
+    if (role !== "assistant" && role !== "user") {
+      return;
+    }
+    const text = this.extractMessageText(message, role);
+    if (!text) {
+      return;
+    }
+    if (role === "user") {
+      if (this.shouldSuppress(chatId, text)) {
+        return;
+      }
+      void this.sendUserEcho(chatId, text);
+      return;
+    }
+    void this.sendAssistantMessage(chatId, text);
+  }
+
+  async ensureTailer(chatId, threadId, sessionPath) {
+    if (!chatId || !sessionPath) {
+      return;
+    }
+    const existing = this.tailers.get(chatId);
+    if (existing && existing.sessionPath === sessionPath) {
+      return;
+    }
+    if (existing) {
+      existing.tailer.stop();
+      this.tailers.delete(chatId);
+    }
+    const tailer = new SessionTailer(sessionPath, (line) =>
+      this.handleSessionLine(chatId, threadId, line),
+    );
+    try {
+      await tailer.start();
+    } catch {
+      return;
+    }
+    this.tailers.set(chatId, { threadId, sessionPath, tailer });
+  }
+
+  async tryHandleText({ chatId, threadId, text }) {
+    if (!this.shouldUse()) {
+      return { handled: false };
+    }
+    const target = await resolveTuiTarget(threadId);
+    if (!target?.ttyPath) {
+      return { handled: false, reason: "no_tty" };
+    }
+    try {
+      await writeToTty(target.ttyPath, text);
+    } catch {
+      return { handled: false, reason: "write_failed" };
+    }
+    this.rememberSuppression(chatId, text);
+    const effectiveThreadId = target.threadId ?? threadId ?? null;
+    if (chatId && effectiveThreadId && effectiveThreadId !== threadId) {
+      await this.store.mutate((state) => {
+        state.active_thread_id = effectiveThreadId;
+        updateBindingSession(state, chatId, {
+          active_thread_id: effectiveThreadId,
+        });
+        pushRecentEvent(state, {
+          source: "daemon",
+          type: "binding_thread_switched",
+          chat_id: chatId,
+          previous_thread_id: threadId ?? null,
+          thread_id: effectiveThreadId,
+          reason: "tui_sync_detected",
+        });
+        return state;
+      });
+    }
+    await this.ensureTailer(chatId, effectiveThreadId, target.sessionPath);
+    return { handled: true, threadId: effectiveThreadId };
+  }
+
+  shutdown() {
+    for (const entry of this.tailers.values()) {
+      entry.tailer.stop();
+    }
+    this.tailers.clear();
+  }
 }
 
 function createInboundMessageDeduper() {
@@ -918,6 +1149,10 @@ function ensureThreadBuffer(state, threadId) {
   if (!state.thread_buffers[threadId]) {
     state.thread_buffers[threadId] = {
       assistant_text: "",
+      turn_assistant_text: "",
+      turn_summary_text: "",
+      seen_assistant_delta: false,
+      seen_summary_delta: false,
       command_output: "",
       file_change_output: "",
       last_turn_id: null,
@@ -925,6 +1160,14 @@ function ensureThreadBuffer(state, threadId) {
       last_model: null,
       last_progress: null,
       last_cwd: null,
+      last_user_text: null,
+      last_user_at: null,
+      last_turn_params: null,
+      auto_retry_count: 0,
+      last_retry_at: null,
+      stream_error_count: 0,
+      last_error_text: null,
+      last_error_at: null,
       turn_started_at: null,
       turn_accepted_at: null,
       turn_accept_ms: null,
@@ -1321,9 +1564,11 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
   const terminalCards = new Map();
   const progressCards = new Map();
   const progressTimers = new Map();
-  const FLUSH_MS = 800;
-  const ASSISTANT_FLUSH_MS = 180;
-  const PROGRESS_FLUSH_MS = 400;
+  const singleCardMode = Boolean(runtime?.single_card_mode);
+  const FLUSH_MS = 80;
+  const ASSISTANT_FLUSH_MS = 450;
+  const ASSISTANT_PATCH_MIN_MS = 450;
+  const PROGRESS_FLUSH_MS = 200;
   const TERMINAL_CARD_KEEP_CHARS = 9000;
   const ASSISTANT_CARD_KEEP_CHARS = 12000;
   const inboundImageDir = path.join(getRunDir(), "inbound-images");
@@ -1340,13 +1585,32 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
     return { chatId, threadId, turnId };
   };
 
-  const routeKeyOf = (routeRef = {}) => {
+  const inflateRouteRef = (routeRef = {}) => {
     const normalized = normalizeRouteRef(routeRef);
+    if (!normalized.turnId || !turnRoutes.has(normalized.turnId)) {
+      return normalized;
+    }
+    const stored = turnRoutes.get(normalized.turnId);
+    if (!stored || typeof stored !== "object") {
+      return normalized;
+    }
+    return normalizeRouteRef({
+      chatId: normalized.chatId ?? stored.chatId ?? null,
+      threadId: normalized.threadId ?? stored.threadId ?? null,
+      turnId: normalized.turnId ?? stored.turnId ?? null,
+    });
+  };
+
+  const routeKeyOf = (routeRef = {}, kind = "assistant") => {
+    const normalized = inflateRouteRef(routeRef);
+    if (singleCardMode && kind === "assistant") {
+      return normalized.turnId ?? normalized.threadId ?? null;
+    }
     return normalized.turnId ?? normalized.threadId ?? null;
   };
 
   const routeStateKeyOf = (chatId, routeRef, kind = "assistant") => {
-    const routeKey = routeKeyOf(routeRef) ?? "unknown";
+    const routeKey = routeKeyOf(routeRef, kind) ?? "unknown";
     return `${chatId}::${routeKey}::${kind}`;
   };
 
@@ -1366,9 +1630,12 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
   };
 
   const resolveRoutes = (routeRef = {}) => {
-    const normalized = normalizeRouteRef(routeRef);
+    const normalized = inflateRouteRef(routeRef);
     if (normalized.turnId && turnRoutes.has(normalized.turnId)) {
-      return [turnRoutes.get(normalized.turnId)];
+      const stored = turnRoutes.get(normalized.turnId);
+      if (stored?.chatId) {
+        return [stored];
+      }
     }
     if (normalized.chatId && normalized.threadId) {
       return [normalized];
@@ -1413,7 +1680,7 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
   };
 
   const ensureAssistantCardState = (routeRef) => {
-    const normalized = normalizeRouteRef(routeRef);
+    const normalized = inflateRouteRef(routeRef);
     if (!normalized.chatId) {
       return null;
     }
@@ -1431,8 +1698,17 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
         last_note: "",
         footer: "",
         completed: false,
+        last_sent_at: 0,
+        last_rate_limit_at: 0,
       };
       assistantCards.set(key, state);
+    } else {
+      if (normalized.threadId) {
+        state.thread_id = normalized.threadId;
+      }
+      if (normalized.turnId) {
+        state.turn_id = normalized.turnId;
+      }
     }
     return state;
   };
@@ -1490,15 +1766,65 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
       updatable: true,
     };
     try {
+      const now = Date.now();
+      if (state.message_id && !options.force) {
+        const since = now - (state.last_sent_at ?? 0);
+        if (since >= 0 && since < ASSISTANT_PATCH_MIN_MS && !payloadText) {
+          return true;
+        }
+      }
       if (state.message_id) {
         await feishu.patchMarkdownCard(state.message_id, payload);
+        await appendEventFn({
+          source: "feishu",
+          type: "assistant_card_patched",
+          chat_id: state.chat_id,
+          thread_id: state.thread_id,
+          turn_id: state.turn_id,
+        }, { persist: false });
       } else {
         state.message_id = await feishu.sendMarkdownCard(state.chat_id, payload);
+        if (state.message_id) {
+          await appendEventFn({
+            source: "feishu",
+            type: "assistant_card_sent",
+            chat_id: state.chat_id,
+            thread_id: state.thread_id,
+            turn_id: state.turn_id,
+          }, { persist: false });
+        } else {
+          await appendEventFn({
+            source: "feishu",
+            type: "assistant_card_send_missing_id",
+            chat_id: state.chat_id,
+            thread_id: state.thread_id,
+            turn_id: state.turn_id,
+          }, { persist: false });
+          try {
+            await feishu.sendText(state.chat_id, markdown);
+          } catch {
+            // noop
+          }
+        }
       }
       state.last_markdown = markdown;
       state.last_note = note;
+      state.last_sent_at = Date.now();
       return true;
     } catch (err) {
+      const errCode = err?.response?.data?.code ?? err?.code ?? null;
+      const errText = String(err?.response?.data?.msg ?? err?.message ?? "");
+      const rateLimited = errCode === 230020 || errText.includes("frequency limit");
+      if (rateLimited && state.message_id) {
+        const now = Date.now();
+        state.last_rate_limit_at = now;
+        if (options.force) {
+          setTimeout(() => {
+            void updateAssistantCard(routeRef, "", { footer: state.footer, completed: state.completed, force: true });
+          }, 500);
+        }
+        return true;
+      }
       try {
         state.message_id = await feishu.sendMarkdownCard(state.chat_id, payload);
         state.last_markdown = markdown;
@@ -1518,8 +1844,39 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
     }
   };
 
+  const resetAssistantCard = (routeRef) => {
+    const state = ensureAssistantCardState(routeRef);
+    if (!state) {
+      return;
+    }
+    state.full_text = "";
+    state.truncated = false;
+    state.last_markdown = "";
+    state.last_note = "";
+    state.footer = "";
+    state.completed = false;
+  };
+
+  const updateAssistantFooter = async (routeRef, footer) => {
+    if (!singleCardMode) {
+      return;
+    }
+    const routes = resolveRoutes(routeRef);
+    if (routes.length === 0) {
+      return;
+    }
+    for (const route of routes) {
+      const state = ensureAssistantCardState(route);
+      if (!state?.message_id && !state?.last_markdown) {
+        continue;
+      }
+      // eslint-disable-next-line no-await-in-loop
+      await updateAssistantCard(route, "", { footer, completed: false });
+    }
+  };
+
   const ensureTerminalCardState = (routeRef, kind) => {
-    const normalized = normalizeRouteRef(routeRef);
+    const normalized = inflateRouteRef(routeRef);
     if (!normalized.chatId) {
       return null;
     }
@@ -1621,6 +1978,25 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
           turn_id: route.turnId,
           error: err?.message ?? String(err),
         });
+      }
+    }
+  };
+
+  const sendFallbackText = async (route, text) => {
+    if (!feishu || !feishu.status().running) {
+      return;
+    }
+    const body = normalizeReadableText(text);
+    if (!body) {
+      return;
+    }
+    const chunks = splitTextChunks(body, 1600);
+    for (const chunk of chunks) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        await feishu.sendText(route.chatId, chunk);
+      } catch {
+        // noop
       }
     }
   };
@@ -1819,18 +2195,22 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
   };
 
   const bufferKeyOf = (routeRef, kind) => {
-    const normalized = normalizeRouteRef(routeRef);
+    const normalized = inflateRouteRef(routeRef);
     return `${normalized.threadId ?? "none"}::${normalized.turnId ?? "none"}::${kind}`;
   };
 
-  const flushKey = async (key) => {
-    const raw = buffers.get(key);
+  const clearBufferKey = (key) => {
     buffers.delete(key);
     const timer = timers.get(key);
     if (timer) {
       clearTimeout(timer);
       timers.delete(key);
     }
+  };
+
+  const flushKey = async (key) => {
+    const raw = buffers.get(key);
+    clearBufferKey(key);
     if (!raw || !raw.text) {
       return;
     }
@@ -1838,8 +2218,8 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
   };
 
   const queue = (routeRef, kind, delta) => {
-    const normalized = normalizeRouteRef(routeRef);
-    if (!normalized.threadId || !delta) {
+    const normalized = inflateRouteRef(routeRef);
+    if ((!normalized.threadId && !normalized.turnId) || !delta) {
       return;
     }
     const key = bufferKeyOf(normalized, kind);
@@ -1862,6 +2242,14 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
     for (const key of keys) {
       await flushKey(key);
     }
+  };
+
+  const resetAssistant = async (routeRef) => {
+    const normalized = inflateRouteRef(routeRef);
+    const key = bufferKeyOf(normalized, "assistant");
+    clearBufferKey(key);
+    resetAssistantCard(normalized);
+    await updateAssistantCard(normalized, "", { footer: "⏳ 生成中…", completed: false, force: true });
   };
 
   const progressKeyOf = (chatId, routeRef) => routeStateKeyOf(chatId, routeRef, "progress");
@@ -1895,6 +2283,9 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
   };
 
   const progressTemplateOf = (state) => {
+    if (state.last_error) {
+      return "orange";
+    }
     if (state.searches_active > 0) {
       return "orange";
     }
@@ -1907,6 +2298,10 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
   const progressMarkdownOf = (state) => {
     const now = Date.now();
     const lines = [];
+    if (state.last_error) {
+      lines.push(`⚠️ ${state.last_error}`);
+      lines.push("");
+    }
     if (state.searches_active > 0) {
       lines.push("🔎 正在联网检索中…");
     } else if (state.first_token_seen) {
@@ -1996,6 +2391,9 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
   };
 
   const updateTurnProgress = (routeRef, updater) => {
+    if (singleCardMode) {
+      return;
+    }
     if (!feishu || !feishu.status().running) {
       return;
     }
@@ -2042,14 +2440,25 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
     for (const route of routes) {
       const assistantState = ensureAssistantCardState(route);
       const assistantText = typeof assistantState?.full_text === "string" ? assistantState.full_text : "";
-      const fallbackAssistantText = typeof completionBuffer?.assistant_text === "string" ? completionBuffer.assistant_text : "";
+      const fallbackAssistantText = (() => {
+        if (typeof completionBuffer?.turn_assistant_text === "string" && completionBuffer.turn_assistant_text.trim()) {
+          return completionBuffer.turn_assistant_text;
+        }
+        if (typeof completionBuffer?.turn_summary_text === "string" && completionBuffer.turn_summary_text.trim()) {
+          return sanitizeReasoningSummary(completionBuffer.turn_summary_text);
+        }
+        return "";
+      })();
       const imageSourceText = assistantText || fallbackAssistantText;
       if (!imageForwardSourceText && imageSourceText) {
         imageForwardSourceText = imageSourceText;
       }
       if (assistantText || fallbackAssistantText) {
-        await updateAssistantCard(route, assistantText ? "" : fallbackAssistantText, { footer, completed: true });
-      } else {
+        await updateAssistantCard(route, assistantText ? "" : fallbackAssistantText, { footer, completed: true, force: true });
+        if (!assistantState?.message_id) {
+          await sendFallbackText(route, assistantText || fallbackAssistantText);
+        }
+      } else if (!singleCardMode) {
         await sendMetaCard(route, footer);
       }
     }
@@ -2082,6 +2491,14 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
     onTurnCompleted,
     onTurnQueued: (routeRef) => {
       const normalized = registerTurn(routeRef);
+      if (singleCardMode) {
+        if (!normalized.turnId) {
+          return;
+        }
+        resetAssistantCard(normalized);
+        void updateAssistantCard(normalized, "", { footer: "⏳ 生成中…", completed: false, force: true });
+        return;
+      }
       updateTurnProgress(normalized, () => {
         // ensure status card appears immediately, even before first stream delta
       });
@@ -2110,13 +2527,37 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
           state.latest_search = meta.search_ref;
         }
       }),
-    onFirstToken: (routeRef) =>
+    onFirstToken: (routeRef) => {
+      if (singleCardMode) {
+        void updateAssistantFooter(routeRef, "✍️ 正在输出…");
+        return;
+      }
       updateTurnProgress(routeRef, (state) => {
         if (!state.first_token_seen) {
           state.first_token_seen = true;
         }
-      }),
+        if (state.last_error) {
+          state.last_error = null;
+          state.last_error_at = null;
+        }
+      });
+    },
+    onStreamError: (routeRef, message) => {
+      const text = normalizeOneLineText(String(message ?? ""), 200);
+      if (!text) {
+        return;
+      }
+      if (singleCardMode) {
+        void updateAssistantFooter(routeRef, `⚠️ ${text}`);
+        return;
+      }
+      updateTurnProgress(routeRef, (state) => {
+        state.last_error = text;
+        state.last_error_at = Date.now();
+      });
+    },
     sendImage: sendImageToRoute,
+    resetAssistant,
     shutdown,
   };
 }
@@ -3113,11 +3554,14 @@ function mapUserFacingError(err) {
   if (lower.includes("invalid_or_expired_code")) {
     return "绑定码无效或已过期。请发送 `/rebind` 获取新绑定码。";
   }
+  if (lower.includes("thread_not_found_rebind")) {
+    return "绑定的会话已失效，请在终端执行 `/prompts:feishu-qrcode` 重新绑定。";
+  }
   if (lower.includes("feishu bridge not running")) {
     return "飞书桥接未就绪。请稍后重试；若持续失败，在终端执行 `codex-feishu init daemon`。";
   }
   if (isThreadNotFoundError(err)) {
-    return "会话已失效，系统会自动恢复。请重发上一条消息。";
+    return "会话已失效，请在终端执行 `/prompts:feishu-qrcode` 重新绑定。";
   }
   if (isAppServerExitError(err)) {
     return "Codex 后端连接中断，正在恢复。请稍后重试。";
@@ -3331,6 +3775,29 @@ function renderThreadHistoryMarkdown(thread, options = {}) {
   return splitMarkdownChunks(lines.join("\n").trim(), 3200);
 }
 
+function extractLatestAgentText(thread) {
+  if (!thread || typeof thread !== "object") {
+    return "";
+  }
+  const turns = Array.isArray(thread.turns) ? thread.turns : [];
+  for (let t = turns.length - 1; t >= 0; t -= 1) {
+    const items = Array.isArray(turns[t]?.items) ? turns[t].items : [];
+    for (let i = items.length - 1; i >= 0; i -= 1) {
+      const item = items[i];
+      if (!item || typeof item !== "object") {
+        continue;
+      }
+      if ((item.type === "agentMessage" || item.type === "assistantMessage") && typeof item.text === "string") {
+        const text = normalizeReadableText(item.text);
+        if (text) {
+          return text;
+        }
+      }
+    }
+  }
+  return "";
+}
+
 async function syncThreadHistoryToChat(store, app, chatId, threadId, ctx = {}) {
   if (!chatId || !threadId || !ctx.feishu || !ctx.feishu.status().running) {
     return { ok: false, skipped: true };
@@ -3410,6 +3877,76 @@ async function startTurnWithAutoRecoverInput(store, app, threadId, input, chatId
     if (!isThreadNotFoundError(err)) {
       throw err;
     }
+    try {
+      await app.resumeThread(firstThreadId);
+      const turnResponse = await app.startTurn(firstThreadId, input, turnParams);
+      const effectiveThreadId = turnResponse?.thread?.id ?? firstThreadId;
+      await appendEvent(store, {
+        source: "daemon",
+        type: "thread_resumed_before_turn",
+        chat_id: chatId ?? null,
+        thread_id: effectiveThreadId,
+        reason: err?.message ?? String(err),
+      });
+      return {
+        threadId: effectiveThreadId,
+        turnResponse,
+        recovered: true,
+        recoveredFromThreadId: null,
+      };
+    } catch (resumeErr) {
+      if (!isThreadNotFoundError(resumeErr)) {
+        throw resumeErr;
+      }
+      // fall through to auto-rebind / auto-recover path
+    }
+    if (chatId) {
+      const snapshot = store.snapshot();
+      const binding = snapshot.bindings?.[chatId] ?? null;
+      const cwdHint = normalizeCwdHint(turnParams?.cwd ?? binding?.active_cwd ?? null);
+      const knownThreadIds = Array.isArray(binding?.known_thread_ids) ? binding.known_thread_ids : [];
+      for (let idx = knownThreadIds.length - 1; idx >= 0; idx -= 1) {
+        const candidate = knownThreadIds[idx];
+        if (!candidate || candidate === firstThreadId) {
+          continue;
+        }
+        try {
+          const readCheck = await callAppServerApi(
+            app,
+            "thread/read",
+            { threadId: candidate },
+            APP_RPC_TIMEOUT_MS,
+          );
+          if (readCheck.ok && !readCheck.unsupported) {
+            const turnResponse = await app.startTurn(candidate, input, turnParams);
+            await store.mutate((state) => {
+              updateBindingSession(state, chatId, {
+                active_thread_id: candidate,
+                active_cwd: cwdHint ?? binding?.active_cwd ?? null,
+              });
+              pushRecentEvent(state, {
+                source: "daemon",
+                type: "thread_auto_rebound",
+                chat_id: chatId,
+                recovered_from_thread_id: firstThreadId,
+                thread_id: candidate,
+                reason: err?.message ?? String(err),
+              });
+              return state;
+            });
+            return {
+              threadId: candidate,
+              turnResponse,
+              recovered: true,
+              recoveredFromThreadId: firstThreadId,
+            };
+          }
+        } catch {
+          // try next candidate
+        }
+      }
+      throw new Error("thread_not_found_rebind");
+    }
     const created = await startNewThread(store, app, null);
     const turnResponse = await app.startTurn(created.threadId, input, turnParams);
     await appendEvent(store, {
@@ -3451,16 +3988,42 @@ function extractLocalImagePathsFromThreadItem(item) {
   return out;
 }
 
-async function handleAppNotification(store, msg, relay) {
+async function handleAppNotification(store, app, msg, relay) {
   const method = msg.method;
   const params = msg.params ?? {};
   const threadId = pickThreadId(params);
-  const turnId = pickTurnId(params);
+  let turnId = pickTurnId(params);
+  if (!turnId && threadId) {
+    const snapshot = store.snapshot();
+    const inferred = snapshot.thread_buffers?.[threadId]?.current_turn_id ?? null;
+    if (inferred) {
+      turnId = inferred;
+      await appendEvent(store, {
+        source: "daemon",
+        type: "turn_id_inferred",
+        thread_id: threadId,
+        turn_id: turnId,
+        method,
+      }, { persist: false });
+    }
+  }
   const methodText = String(method ?? "");
   const isWebSearchBegin = methodText.endsWith("web_search_begin");
   const isWebSearchEnd = methodText.endsWith("web_search_end");
   const searchRef = isWebSearchBegin || isWebSearchEnd ? formatSearchReference(params) : null;
+  const isAssistantDelta =
+    method === "item/agentMessage/delta" || method === "item/assistantMessage/delta";
+  const isSummaryDelta = method === "item/reasoning/summaryTextDelta";
+  const deltaText =
+    typeof params.delta === "string"
+      ? params.delta
+      : typeof params.text === "string"
+        ? params.text
+        : "";
   let sawFirstToken = false;
+  let emitAssistantDelta = false;
+  let emitSummaryDelta = false;
+  let shouldResetAssistantCard = false;
   const routeRef = { threadId, turnId };
 
   await store.mutate((state) => {
@@ -3474,8 +4037,23 @@ async function handleAppNotification(store, msg, relay) {
     if (threadId) {
       const buffer = ensureThreadBuffer(state, threadId);
       const hints = extractThreadHints(params);
-      if (method === "item/agentMessage/delta") {
-        buffer.assistant_text += params.delta ?? "";
+      if (isAssistantDelta && deltaText) {
+        if (!buffer.seen_assistant_delta && buffer.seen_summary_delta) {
+          buffer.turn_assistant_text = "";
+          shouldResetAssistantCard = true;
+        }
+        buffer.seen_assistant_delta = true;
+        buffer.turn_assistant_text += deltaText;
+        buffer.assistant_text = buffer.turn_assistant_text;
+        emitAssistantDelta = true;
+        if (!buffer.first_token_at && typeof buffer.turn_started_at === "number") {
+          buffer.first_token_at = Date.now();
+          buffer.first_token_ms = Math.max(0, buffer.first_token_at - buffer.turn_started_at);
+          sawFirstToken = true;
+        }
+      } else if (isSummaryDelta && deltaText && !buffer.seen_assistant_delta) {
+        buffer.seen_summary_delta = true;
+        buffer.turn_summary_text += deltaText;
         if (!buffer.first_token_at && typeof buffer.turn_started_at === "number") {
           buffer.first_token_at = Date.now();
           buffer.first_token_ms = Math.max(0, buffer.first_token_at - buffer.turn_started_at);
@@ -3489,12 +4067,26 @@ async function handleAppNotification(store, msg, relay) {
         buffer.last_turn_id = params?.turn?.id ?? turnId ?? null;
         buffer.last_turn_status = params?.turn?.status ?? null;
         buffer.current_turn_id = null;
+        buffer.stream_error_count = 0;
+        buffer.last_error_text = null;
+        buffer.last_error_at = null;
         for (const [chatId, binding] of Object.entries(state.bindings ?? {})) {
           if (binding?.active_thread_id === threadId && binding?.current_turn_id === (turnId ?? null)) {
             updateBindingSession(state, chatId, {
               current_turn_id: null,
             });
           }
+        }
+      }
+      if (method === "codex/event/stream_error" || method === "error") {
+        buffer.stream_error_count = (buffer.stream_error_count ?? 0) + 1;
+        const message =
+          (method === "codex/event/stream_error" ? params?.msg?.message : null) ??
+          params?.error?.message ??
+          null;
+        if (typeof message === "string" && message.trim()) {
+          buffer.last_error_text = message.trim();
+          buffer.last_error_at = Date.now();
         }
       }
       if (hints.model) {
@@ -3513,8 +4105,11 @@ async function handleAppNotification(store, msg, relay) {
   }, { persist: false });
 
   if (threadId && relay) {
-    if (method === "item/agentMessage/delta" && typeof params.delta === "string") {
-      relay.queue(routeRef, "assistant", params.delta);
+    if (shouldResetAssistantCard && typeof relay.resetAssistant === "function") {
+      await relay.resetAssistant(routeRef);
+    }
+    if (emitAssistantDelta && deltaText) {
+      relay.queue(routeRef, "assistant", deltaText);
       if (sawFirstToken) {
         relay.onFirstToken(routeRef);
       }
@@ -3531,7 +4126,50 @@ async function handleAppNotification(store, msg, relay) {
         await relay.sendImage(routeRef, imagePath);
       }
     } else if (method === "turn/completed") {
+      const snapshot = store.snapshot();
+      const buffer = snapshot.thread_buffers?.[threadId] ?? null;
+      const assistantText = typeof buffer?.turn_assistant_text === "string"
+        ? buffer.turn_assistant_text.trim()
+        : "";
+      const shouldRefreshFromThread = !assistantText || Boolean(buffer?.seen_summary_delta);
+      if (shouldRefreshFromThread) {
+        try {
+          const readCall = await callAppServerApi(
+            app,
+            "thread/read",
+            { threadId, includeTurns: true },
+            3000,
+          );
+          if (readCall.ok && !readCall.unsupported) {
+            const fallback = extractLatestAgentText(readCall.result?.thread ?? null);
+            if (fallback) {
+              await store.mutate((state) => {
+                const target = ensureThreadBuffer(state, threadId);
+                if (target) {
+                  target.turn_assistant_text = fallback;
+                  target.assistant_text = fallback;
+                }
+                return state;
+              }, { persist: false });
+            }
+          }
+        } catch (err) {
+          await appendEvent(store, {
+            source: "daemon",
+            type: "thread_read_fallback_failed",
+            thread_id: threadId,
+            error: err?.message ?? String(err),
+          }, { persist: false });
+        }
+      }
       await relay.onTurnCompleted(routeRef, params?.turn?.status ?? null);
+    }
+    if ((method === "codex/event/stream_error" || method === "error") && typeof relay.onStreamError === "function") {
+      const streamMessage =
+        (method === "codex/event/stream_error" ? params?.msg?.message : null) ??
+        params?.error?.message ??
+        null;
+      relay.onStreamError(routeRef, streamMessage);
     }
     if (isWebSearchBegin) {
       relay.onSearchStarted(routeRef, { search_ref: searchRef });
@@ -3545,6 +4183,26 @@ async function handleAppNotification(store, msg, relay) {
       } else if (isWebSearchEnd) {
         relay.onSearchCompleted({ turnId }, { search_ref: searchRef });
       }
+    }
+  } else if (relay && (method === "codex/event/stream_error" || method === "error")) {
+    const msgText =
+      (method === "codex/event/stream_error" ? params?.msg?.message : null) ??
+      params?.error?.message ??
+      null;
+    const snapshot = store.snapshot();
+    const routes = [];
+    for (const binding of Object.values(snapshot.bindings ?? {})) {
+      if (!binding?.chat_id || !binding?.active_thread_id || !binding?.current_turn_id) {
+        continue;
+      }
+      routes.push({
+        chatId: binding.chat_id,
+        threadId: binding.active_thread_id,
+        turnId: binding.current_turn_id,
+      });
+    }
+    for (const route of routes) {
+      relay.onStreamError(route, msgText);
     }
   }
 }
@@ -4652,6 +5310,11 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
         buffer.first_token_at = null;
         buffer.first_token_ms = null;
         buffer.current_turn_id = turnId;
+        buffer.assistant_text = "";
+        buffer.turn_assistant_text = "";
+        buffer.turn_summary_text = "";
+        buffer.seen_assistant_delta = false;
+        buffer.seen_summary_delta = false;
         if (resolved.cwd) {
           buffer.last_cwd = resolved.cwd;
         }
@@ -5231,6 +5894,27 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
     if (turnOverrides.sandboxPolicy) {
       turnParams.sandboxPolicy = turnOverrides.sandboxPolicy;
     }
+    if (ctx.tuiMirror) {
+      const tuiResult = await ctx.tuiMirror.tryHandleText({
+        chatId,
+        threadId: preferredThreadId,
+        text: finalText,
+      });
+      if (tuiResult?.handled) {
+        const nextThreadId = tuiResult.threadId ?? preferredThreadId;
+        return {
+          ok: true,
+          thread_id: nextThreadId,
+          reply_text: "已发送到终端，等待 Codex 回复…",
+          reply_card: {
+            title: "会话状态",
+            template: "blue",
+            markdown: `⏳ 已发送到终端，等待 Codex 回复…\n- 会话ID ${nextThreadId ?? "(unknown)"}`,
+          },
+        };
+      }
+    }
+    const singleCardMode = Boolean(ctx.runtime?.single_card_mode);
     const turnRequestStartedAt = Date.now();
     const submitResult = await startTurnWithAutoRecover(
       store,
@@ -5255,6 +5939,16 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
         buffer.first_token_at = null;
         buffer.first_token_ms = null;
         buffer.current_turn_id = turnId;
+        buffer.assistant_text = "";
+        buffer.turn_assistant_text = "";
+        buffer.turn_summary_text = "";
+        buffer.seen_assistant_delta = false;
+        buffer.seen_summary_delta = false;
+        buffer.last_user_text = finalText;
+        buffer.last_user_at = turnRequestStartedAt;
+        buffer.last_turn_params = { ...turnParams };
+        buffer.auto_retry_count = 0;
+        buffer.last_retry_at = null;
         if (activeCwd) {
           buffer.last_cwd = activeCwd;
         }
@@ -5287,6 +5981,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
     return {
       ok: true,
       thread_id: threadId,
+      suppress_reply: singleCardMode,
       reply_text: submitResult.recovered
         ? "检测到旧会话失效，已自动切换并开始生成…"
         : "已收到，正在生成…",
@@ -5348,6 +6043,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
     if (turnOverrides.sandboxPolicy) {
       turnParams.sandboxPolicy = turnOverrides.sandboxPolicy;
     }
+    const singleCardMode = Boolean(ctx.runtime?.single_card_mode);
     const turnRequestStartedAt = Date.now();
     const submitResult = await startTurnWithAutoRecoverInput(
       store,
@@ -5372,6 +6068,18 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
         buffer.first_token_at = null;
         buffer.first_token_ms = null;
         buffer.current_turn_id = turnId;
+        buffer.assistant_text = "";
+        buffer.turn_assistant_text = "";
+        buffer.turn_summary_text = "";
+        buffer.seen_assistant_delta = false;
+        buffer.seen_summary_delta = false;
+        if (typeof finalText === "string" && finalText.trim()) {
+          buffer.last_user_text = finalText;
+          buffer.last_user_at = turnRequestStartedAt;
+          buffer.last_turn_params = { ...turnParams };
+          buffer.auto_retry_count = 0;
+          buffer.last_retry_at = null;
+        }
         if (activeCwd) {
           buffer.last_cwd = activeCwd;
         }
@@ -5419,6 +6127,7 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
     return {
       ok: true,
       thread_id: threadId,
+      suppress_reply: singleCardMode,
       reply_text: submitResult.recovered
         ? startTextRecovered
         : startText,
@@ -5610,53 +6319,38 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
 
     let binding = store.snapshot().bindings?.[chatId] ?? null;
     if (!binding) {
-      if (isPrivateChatType(chatType)) {
-        await store.mutate((state) => {
-          let activeCwd = null;
-          let activeThreadId = null;
-          const bindHint = pickAutoBindHint(state, chatId);
-          if (bindHint) {
-            if (bindHint.cwdHint) {
-              activeCwd = bindHint.cwdHint;
-            }
-            if (bindHint.threadIdHint) {
-              activeThreadId = bindHint.threadIdHint;
-            }
-            delete state.pending_bind_codes[bindHint.code];
+      await store.mutate((state) => {
+        let activeCwd = null;
+        let activeThreadId = null;
+        const bindHint = pickAutoBindHint(state, chatId);
+        if (bindHint) {
+          if (bindHint.cwdHint) {
+            activeCwd = bindHint.cwdHint;
           }
-          const existed = state.bindings?.[chatId] ?? null;
-          updateBindingSession(state, chatId, {
-            chat_id: chatId,
-            user_id: userId ?? existed?.user_id ?? null,
-            bound_at: Date.now(),
-            active_thread_id: activeThreadId,
-            active_cwd: activeCwd,
-          });
-          pushRecentEvent(state, {
-            source: "daemon",
-            type: "binding_auto_completed",
-            chat_id: chatId,
-            thread_id: activeThreadId,
-            cwd: activeCwd,
-            code_consumed: bindHint?.code ?? null,
-            bind_hint_source: bindHint?.source ?? null,
-          });
-          return state;
+          if (bindHint.threadIdHint) {
+            activeThreadId = bindHint.threadIdHint;
+          }
+          delete state.pending_bind_codes[bindHint.code];
+        }
+        const existed = state.bindings?.[chatId] ?? null;
+        updateBindingSession(state, chatId, {
+          chat_id: chatId,
+          user_id: userId ?? existed?.user_id ?? null,
+          bound_at: Date.now(),
+          active_thread_id: activeThreadId,
+          active_cwd: activeCwd,
         });
-      } else {
-        const bindInfo = await ensureBindCodeForChat(store, chatId);
-        const openChatLink = buildChatOpenLink((ctx.bridgeConfig?.bot_open_id ?? "").trim());
-        return {
-          ok: true,
-          unbound: true,
-          group_hint: true,
-          bind_code: bindInfo.code,
-          bind_command: bindInfo.bindCommand,
-          expires_at: bindInfo.expiresAt,
-          open_chat_link: openChatLink,
-          reply_text: `当前会话尚未绑定，请先发送：${bindInfo.bindCommand}`,
-        };
-      }
+        pushRecentEvent(state, {
+          source: "daemon",
+          type: "binding_auto_completed",
+          chat_id: chatId,
+          thread_id: activeThreadId,
+          cwd: activeCwd,
+          code_consumed: bindHint?.code ?? null,
+          bind_hint_source: bindHint?.source ?? null,
+        });
+        return state;
+      });
     }
 
     if (!ctx.feishu || !ctx.feishu.status().running) {
@@ -6109,66 +6803,52 @@ async function handleRpcCall(store, app, method, params, ctx = {}) {
 
     let binding = store.snapshot().bindings?.[chatId] ?? null;
     if (!binding) {
-      if (isPrivateChatType(chatType)) {
-        await store.mutate((state) => {
-          let activeCwd = null;
-          let activeThreadId = null;
-          const bindHint = pickAutoBindHint(state, chatId);
-          if (bindHint) {
-            if (bindHint.cwdHint) {
-              activeCwd = bindHint.cwdHint;
-            }
-            if (bindHint.threadIdHint) {
-              activeThreadId = bindHint.threadIdHint;
-            }
-            delete state.pending_bind_codes[bindHint.code];
+      await store.mutate((state) => {
+        let activeCwd = null;
+        let activeThreadId = null;
+        const bindHint = pickAutoBindHint(state, chatId);
+        if (bindHint) {
+          if (bindHint.cwdHint) {
+            activeCwd = bindHint.cwdHint;
           }
-          const existed = state.bindings?.[chatId] ?? null;
-          updateBindingSession(state, chatId, {
-            chat_id: chatId,
-            user_id: userId ?? existed?.user_id ?? null,
-            bound_at: Date.now(),
-            active_thread_id: activeThreadId,
-            active_cwd: activeCwd,
-          });
-          pushRecentEvent(state, {
-            source: "daemon",
-            type: "binding_auto_completed",
-            chat_id: chatId,
-            thread_id: activeThreadId,
-            cwd: activeCwd,
-            code_consumed: bindHint?.code ?? null,
-            bind_hint_source: bindHint?.source ?? null,
-          });
-          return state;
+          if (bindHint.threadIdHint) {
+            activeThreadId = bindHint.threadIdHint;
+          }
+          delete state.pending_bind_codes[bindHint.code];
+        }
+        const existed = state.bindings?.[chatId] ?? null;
+        updateBindingSession(state, chatId, {
+          chat_id: chatId,
+          user_id: userId ?? existed?.user_id ?? null,
+          bound_at: Date.now(),
+          active_thread_id: activeThreadId,
+          active_cwd: activeCwd,
         });
-        const autoBinding = store.snapshot().bindings?.[chatId] ?? null;
-        return handleRpcCall(
-          store,
-          app,
-          "feishu/submit_text",
-          {
-            text,
-            chat_id: chatId,
-            user_id: userId,
-            thread_id: autoBinding?.active_thread_id ?? null,
-            cwd: autoBinding?.active_cwd ?? null,
-          },
-          ctx,
-        );
-      }
-      const bindInfo = await ensureBindCodeForChat(store, chatId);
-      const openChatLink = buildChatOpenLink((ctx.bridgeConfig?.bot_open_id ?? "").trim());
-      return {
-        ok: true,
-        unbound: true,
-        group_hint: true,
-        bind_code: bindInfo.code,
-        bind_command: bindInfo.bindCommand,
-        expires_at: bindInfo.expiresAt,
-        open_chat_link: openChatLink,
-        reply_text: `当前会话尚未绑定，请先发送：${bindInfo.bindCommand}`,
-      };
+        pushRecentEvent(state, {
+          source: "daemon",
+          type: "binding_auto_completed",
+          chat_id: chatId,
+          thread_id: activeThreadId,
+          cwd: activeCwd,
+          code_consumed: bindHint?.code ?? null,
+          bind_hint_source: bindHint?.source ?? null,
+        });
+        return state;
+      });
+      const autoBinding = store.snapshot().bindings?.[chatId] ?? null;
+      return handleRpcCall(
+        store,
+        app,
+        "feishu/submit_text",
+        {
+          text,
+          chat_id: chatId,
+          user_id: userId,
+          thread_id: autoBinding?.active_thread_id ?? null,
+          cwd: autoBinding?.active_cwd ?? null,
+        },
+        ctx,
+      );
     }
 
     return handleRpcCall(
@@ -6207,6 +6887,7 @@ export async function runDaemon() {
   const bridgeConfig = await readJsonIfExists(getBridgeConfigPath());
   const runtime = {
     defaultModel: await loadConfiguredModelHint(),
+    single_card_mode: bridgeConfig?.single_card_mode !== false,
   };
   const initialAppCwd = pickInitialAppCwd(store.snapshot(), bridgeConfig);
 
@@ -6301,6 +6982,9 @@ export async function runDaemon() {
     if (!feishu || !chatId || !result) {
       return;
     }
+    if (result?.suppress_reply) {
+      return;
+    }
     if (result?.unbound && result?.bind_command) {
       try {
         await feishu.sendBindCard(chatId, {
@@ -6378,13 +7062,14 @@ export async function runDaemon() {
         text: typeof opts?.text === "string" ? opts.text : null,
         image_paths: entry.images,
       },
-      { feishu, pending, runtime, relay },
+      { feishu, pending, runtime, relay, tuiMirror },
     );
     await deliverFeishuResult(chatId, result);
     return true;
   };
 
   let feishu = null;
+  let tuiMirror = null;
   if (bridgeConfig?.app_id && bridgeConfig?.app_secret) {
     feishu = new FeishuBridge({
       appId: bridgeConfig.app_id,
@@ -6431,7 +7116,7 @@ export async function runDaemon() {
                   image_key: message.imageKey,
                   defer: true,
                 },
-                { feishu, pending, runtime, relay },
+                { feishu, pending, runtime, relay, tuiMirror },
               );
               if (result?.image_path) {
                 const count = stageImageDraft(message.chatId, result.image_path, message);
@@ -6558,7 +7243,7 @@ export async function runDaemon() {
                 user_id: message.userId,
                 chat_type: message.chatType,
               },
-              { feishu, pending, runtime, relay },
+              { feishu, pending, runtime, relay, tuiMirror },
             );
             await deliverFeishuResult(message.chatId, result);
           } catch (err) {
@@ -6590,12 +7275,38 @@ export async function runDaemon() {
     feishu,
     appendEventFn: (event) => appendEvent(store, event),
   });
+  tuiMirror = new TuiMirror({
+    store,
+    feishu,
+    bridgeConfig,
+  });
 
   app.on("notification", async (msg) => {
     try {
-      await handleAppNotification(store, msg, relay);
+      await handleAppNotification(store, app, msg, relay);
     } catch {
       // keep stream alive
+    }
+    // auto-retry intentionally disabled
+    if (msg?.method === "turn/completed" && typeof maybeAutoRetryFailedTurn === "function") {
+      try {
+        await maybeAutoRetryFailedTurn(
+          store,
+          app,
+          relay,
+          pickThreadId(msg?.params),
+          msg?.params?.turn?.status ?? null,
+        );
+      } catch {
+        // noop
+      }
+    }
+    if ((msg?.method === "codex/event/stream_error" || msg?.method === "error") && typeof maybeAutoRetryOnStreamError === "function") {
+      try {
+        await maybeAutoRetryOnStreamError(store, app, relay, pickThreadId(msg?.params));
+      } catch {
+        // noop
+      }
     }
   });
   app.on("request", async (msg) => {
@@ -6656,6 +7367,7 @@ export async function runDaemon() {
         bridgeConfig,
         runtime,
         relay,
+        tuiMirror,
       }),
     onNotification: async (method, params) => {
       await appendEvent(store, {
@@ -6673,6 +7385,9 @@ export async function runDaemon() {
         await store.flush();
         removePidFileIfOwned(pidPath);
         relay.shutdown();
+        if (tuiMirror) {
+          tuiMirror.shutdown();
+        }
         await pending.shutdown();
         if (feishu) {
           await feishu.stop();

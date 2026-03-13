@@ -64,21 +64,20 @@ The bridge should prefer app-server protocol capabilities directly:
 
 ### Preferred flow
 
-1. User is inside a Codex conversation in terminal.
-2. User triggers a bridge action from Codex.
-3. Bridge generates a QR/bind payload tied to the current thread.
-4. User scans in Feishu and lands in the bot conversation.
-5. The Feishu chat becomes another view for that thread.
+1. User starts chatting in Feishu or terminal.
+2. Bridge auto-binds on first message (private/group).
+3. The Feishu chat becomes another view for that thread.
+4. Optional fallback: generate a QR/bind payload to force binding to a specific thread.
 
 ## Slash command reality
 
-The ideal terminal UX is `/feishu-qrcode`.
+The ideal terminal UX is a lightweight bind trigger (if needed).
 
 However, the bridge should not assume custom slash commands are injectable into Codex core.
 Practical options should be evaluated in this order:
 
 1. Native Codex extension point, if one exists.
-2. Codex prompt entry (for example `/prompts:feishu-qrcode`) if supported.
+2. Codex prompt entry (if supported).
 3. MCP tool invocation surfaced naturally in Codex.
 4. External shell command fallback.
 
@@ -136,7 +135,7 @@ The bridge architecture should not depend on any one of these trigger mechanisms
 - Turn-to-chat exact routing
 - Streaming assistant output
 - Approval/input relay
-- Basic commands: bind/status/new/stop
+- Basic commands: status/new/stop
 
 ### Phase 2
 
@@ -148,7 +147,7 @@ The bridge architecture should not depend on any one of these trigger mechanisms
 
 - Generalized transport adapter for non-Feishu UIs
 - Optional terminal-originated thread mirroring enhancements
-- Better bind trigger UX inside Codex
+- Optional bind trigger UX inside Codex (fallback only)
 
 ## Current branch intent
 

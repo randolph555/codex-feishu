@@ -19,7 +19,7 @@ function parseMessageContent(messageContent) {
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
     return parsed;
   }
-  return {};
+  return { __raw_text: messageContent };
 }
 
 function findFirstStringValue(source, keys, maxDepth = 4) {
@@ -78,7 +78,16 @@ function normalizeMessageEvent(payload) {
   const message = event.message ?? {};
   const sender = event.sender ?? {};
   const content = parseMessageContent(message.content);
-  const text = typeof content?.text === "string" ? content.text : "";
+  let text = typeof content?.text === "string" ? content.text : "";
+  if (!text) {
+    const fallback = findFirstStringValue(content, ["text", "content", "text_content", "plain_text"]);
+    if (fallback) {
+      text = fallback;
+    }
+  }
+  if (!text && typeof content?.__raw_text === "string") {
+    text = content.__raw_text;
+  }
   const imageKey = findFirstStringValue(content, ["image_key", "imageKey"]);
   const fileKey = findFirstStringValue(content, ["file_key", "fileKey"]);
   const fileName = findFirstStringValue(content, ["file_name", "fileName", "name"]);
@@ -244,6 +253,13 @@ export class FeishuBridge extends RemoteUiAdapter {
           return;
         }
         if (normalized.messageType === "text" && !normalized.text) {
+          this.onEvent({
+            type: "feishu_message_inbound_empty_text",
+            chat_id: normalized.chatId,
+            user_id: normalized.userId,
+            message_type: normalized.messageType ?? "unknown",
+            chat_type: normalized.chatType ?? "unknown",
+          });
           return;
         }
 

@@ -2,7 +2,7 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { ensureDir, readJsonIfExists, readTextIfExists, writeText } from "../lib/fs_utils.js";
-import { hasManagedMcpBlock, upsertManagedMcpBlock } from "../lib/install_config.js";
+import { hasManagedMcpBlock, hasMcpServerSection, upsertManagedMcpBlock } from "../lib/install_config.js";
 import { getBridgeConfigPath, getBridgeHome, getCodexConfigPath, getPromptsDir } from "../lib/paths.js";
 
 const FEISHU_QRCODE_PROMPT_NAME = "feishu-qrcode";
@@ -138,7 +138,7 @@ async function ensureCodexConfigHasMcpBlock() {
   const configDir = path.dirname(configPath);
   await ensureDir(configDir);
   const current = (await readTextIfExists(configPath)) ?? "";
-  if (hasManagedMcpBlock(current)) {
+  if (hasManagedMcpBlock(current) || hasMcpServerSection(current, "codex_feishu")) {
     return { updated: false, configPath };
   }
   await writeText(configPath, upsertManagedMcpBlock(current, "codex-feishu", ["mcp"]));

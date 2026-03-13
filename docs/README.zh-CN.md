@@ -39,19 +39,9 @@ Windows 说明：
 
 ## init/daemon 说明
 
-- `init ... daemon` 会自动重启后台 daemon，并自动打印绑定信息（含二维码/链接/绑定指令）。
+- `init ... daemon` 会自动重启后台 daemon。
 - daemon 按单实例运行；`init ... daemon` 会先停止旧进程，再启动新进程。
-- 需要重新获取绑定信息时，执行：
-
-```bash
-codex-feishu qrcode
-```
-
-在 Codex 会话里也可直接触发：
-
-```text
-/prompts:feishu-qrcode
-```
+- 私聊/群聊默认自动绑定；二维码/绑定码仅作为备用手段。
 
 - 日志文件：`~/.codex-feishu/run/daemon.log`
 - Linux/macOS 实时看日志：`tail -f ~/.codex-feishu/run/daemon.log`
@@ -76,8 +66,6 @@ codex
 
 ### 基础
 
-- `/bind <CODE>`：绑定当前飞书会话到 Codex
-- `/rebind`：解除当前绑定并生成新绑定码
 - `/status`：查看当前会话状态（会话ID、目录、待审批等）
 - `/help`：查看命令帮助
 - `/group`：查看群聊触发与绑定说明
@@ -117,8 +105,8 @@ codex
 
 ## 行为细节
 
-- 私聊支持自动绑定：首次消息可自动建立映射并继续转发。
-- 群聊建议 `@机器人` 触发；未绑定时需先 `/bind <CODE>`。
+- 私聊/群聊均支持自动绑定：首次消息可自动建立映射并继续转发。
+- 群聊建议 `@机器人` 触发（避免被其他聊天刷屏）。
 - `/mcp` 返回是对原生 `codex mcp ...` 的透传，通常是代码块/表格样式。
 - 线程失效时，daemon 会自动新建线程并重试一次。
 

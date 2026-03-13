@@ -15,7 +15,7 @@ Codex remote access, straight from Feishu. Use Codex from terminal or Feishu wit
   - Codex streaming output -> Feishu cards/text
   - approvals / request_user_input -> Feishu quick actions
 - per-chat mapping for `thread_id` and `cwd`.
-- private chat auto-bind, group chat supports bind code.
+- private/group chat auto-bind (bind code is optional fallback).
 
 ## Preview
 
@@ -63,22 +63,9 @@ codex-feishu init --app-id <FEISHU_APP_ID> --app-secret <FEISHU_APP_SECRET> daem
 ```
 
 Notes:
-- `init ... daemon` restarts daemon in background and prints bind info automatically.
+- `init ... daemon` restarts daemon in background.
 - Daemon is treated as singleton; `init ... daemon` will stop previous daemon instances first.
-- If `bot_open_id` can be auto-detected, QR opens bot chat directly.
-- If auto-detect fails, it degrades to `/bind CODE` mode (still usable).
-
-Refresh bind payload anytime:
-
-```bash
-codex-feishu qrcode
-```
-
-Codex-side trigger after `init`:
-
-```text
-/prompts:feishu-qrcode
-```
+- Binding is automatic for private and group chats. QR/bind payloads are optional fallback only.
 
 ## Quick start (Windows)
 
@@ -116,8 +103,6 @@ codex
 ## Feishu commands
 
 Core:
-- `/bind <CODE>`: bind current Feishu chat
-- `/rebind`: reset binding and generate a new bind code
 - `/status`: show current chat status
 - `/help`: show command help
 - `/group`: show group-chat usage guide
