@@ -1,0 +1,63 @@
+name: Publish NPM
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Validate package entry
+        run: node bin/codex-feishu.js help
+
+      - name: Check if version already exists on npm
+        id: version_check
+        shell: bash
+        run: |
+          PACKAGE_NAME="$(node -p "require('./package.json').name")"
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          echo "package_name=${PACKAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "package_version=${PACKAGE_VERSION}" >> "$GITHUB_OUTPUT"
+
+          if npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version --json > /tmp/npm-version.json 2>/dev/null; then
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            echo "Version ${PACKAGE_VERSION} already published, skip."
+          else
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            echo "Version ${PACKAGE_VERSION} not found, publish."
+          fi
+
+      - name: Publish to npm
+        if: steps.version_check.outputs.should_publish == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
+
+      - name: Summary
+        run: |
+          echo "Package: ${{ steps.version_check.outputs.package_name }}"
+          echo "Version: ${{ steps.version_check.outputs.package_version }}"
+          echo "Published: ${{ steps.version_check.outputs.should_publish }}"

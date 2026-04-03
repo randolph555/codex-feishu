@@ -9,6 +9,16 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function uniqueNonEmptyStrings(items = []) {
+  return [...new Set(items.filter((item) => typeof item === "string" && item.trim()).map((item) => item.trim()))];
+}
+
+function getCurrentDaemonMarkers() {
+  const entry = process.argv[1];
+  const stableBinEntry = fileURLToPath(new URL("../../bin/codex-feishu.js", import.meta.url));
+  return uniqueNonEmptyStrings([entry, stableBinEntry]);
+}
+
 function toPid(value) {
   const n = Number.parseInt(String(value || "").trim(), 10);
   return Number.isFinite(n) && n > 0 ? n : null;
@@ -49,7 +59,7 @@ async function removePidFile() {
 async function isDaemonRpcResponsive(timeoutMs = 1000) {
   try {
     const endpoint = getBridgeRpcEndpoint();
-    const pong = await callJsonRpc(endpoint, "ping", {}, { timeoutMs });
+    const pong = await callJsonRpc(endpoint, "bridge/ping", {}, { timeoutMs });
     return Boolean(pong?.ok);
   } catch {
     return false;
@@ -99,12 +109,13 @@ async function stopByPid(pid, timeoutMs = 3000) {
   return { action: "killed", pid, signal: "SIGKILL" };
 }
 
-function listDaemonPids() {
+function listDaemonPids(markers = []) {
   if (process.platform === "win32") {
     // Keep Windows path simple and rely on pid file + explicit restart flow.
     // `ps` is not guaranteed to exist on native Windows environments.
     return [];
   }
+  const normalizedMarkers = uniqueNonEmptyStrings(markers);
   try {
     const ps = spawnSync("ps", ["-axo", "pid=,command="], {
       encoding: "utf8",
@@ -127,7 +138,10 @@ function listDaemonPids() {
       if (!pid || pid === process.pid) {
         continue;
       }
-      if (/\bcodex-feishu\s+daemon(?:\s|$)/.test(command)) {
+      const matchesMarker =
+        normalizedMarkers.length === 0 ||
+        normalizedMarkers.some((marker) => command.includes(marker));
+      if (matchesMarker && /\bdaemon(?:\s|$)/.test(command)) {
         pids.push(pid);
       }
     }
@@ -190,8 +204,9 @@ export async function restartDaemonDetached() {
   await ensureDir(getRunDir());
   const logPath = getDaemonLogPath();
   const { pidPath, pid } = await readPidFile();
+  const daemonMarkers = getCurrentDaemonMarkers();
 
-  const stopTargets = new Set([...listDaemonPids(), ...(pid ? [pid] : [])]);
+  const stopTargets = new Set([...listDaemonPids(daemonMarkers), ...(pid ? [pid] : [])]);
   const stopResults = [];
   for (const targetPid of stopTargets) {
     // eslint-disable-next-line no-await-in-loop
@@ -209,20 +224,18 @@ export async function restartDaemonDetached() {
     stopResult = { action: "cleaned_stale", pid: null, count: stopResults.length };
   }
   await removePidFile();
-
-  const entry = process.argv[1];
-  const stableBinEntry = fileURLToPath(new URL("../../bin/codex-feishu.js", import.meta.url));
-  const candidateEntries = [...new Set([stableBinEntry, entry].filter(Boolean))];
+  const candidateEntries = daemonMarkers;
   const attempts = [];
+  const daemonArgs = ["daemon", "--foreground"];
   if (process.platform === "win32") {
     for (const cliEntry of candidateEntries) {
-      attempts.push([process.execPath, [cliEntry, "daemon"]]);
+      attempts.push([process.execPath, [cliEntry, ...daemonArgs]]);
     }
-    attempts.push(["cmd.exe", ["/d", "/s", "/c", "codex-feishu daemon"]]);
+    attempts.push(["cmd.exe", ["/d", "/s", "/c", "codex-feishu daemon --foreground"]]);
   } else {
-    attempts.push(["codex-feishu", ["daemon"]]);
+    attempts.push(["codex-feishu", daemonArgs]);
     for (const cliEntry of candidateEntries) {
-      attempts.push([process.execPath, [cliEntry, "daemon"]]);
+      attempts.push([process.execPath, [cliEntry, ...daemonArgs]]);
     }
   }
 
@@ -273,8 +286,9 @@ export async function stopDaemon() {
   await ensureDir(getRunDir());
   const logPath = getDaemonLogPath();
   const { pidPath, pid } = await readPidFile();
+  const daemonMarkers = getCurrentDaemonMarkers();
 
-  const stopTargets = new Set([...listDaemonPids(), ...(pid ? [pid] : [])]);
+  const stopTargets = new Set([...listDaemonPids(daemonMarkers), ...(pid ? [pid] : [])]);
   const stopResults = [];
   for (const targetPid of stopTargets) {
     // eslint-disable-next-line no-await-in-loop

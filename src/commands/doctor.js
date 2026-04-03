@@ -2,6 +2,8 @@ import { execFileSync } from "node:child_process";
 import { readTextIfExists } from "../lib/fs_utils.js";
 import {
   getBridgeConfigPath,
+  getBridgeHome,
+  getBridgeProfile,
   getBridgeRpcEndpoint,
   getCodexConfigPath,
 } from "../lib/paths.js";
@@ -76,6 +78,8 @@ export async function runDoctor() {
 
   // eslint-disable-next-line no-console
   console.log("codex-feishu doctor\n");
+  // eslint-disable-next-line no-console
+  console.log(`[INFO] bridge home ${getBridgeHome()} (profile=${getBridgeProfile()})`);
   // eslint-disable-next-line no-console
   console.log(`[${mark(codexCheck.ok)}] codex binary ${codexCheck.ok ? codexCheck.output : "not found"}`);
   // eslint-disable-next-line no-console

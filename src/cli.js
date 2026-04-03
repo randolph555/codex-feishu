@@ -5,8 +5,9 @@ import { runInbound } from "./commands/inbound.js";
 import { runInit } from "./commands/init.js";
 import { runMcp } from "./commands/mcp.js";
 import { runUninstall } from "./commands/uninstall.js";
-import { fetchQrcode, formatQrcodeSummary, renderAsciiQr, runQrcode } from "./commands/qrcode.js";
+import { runQrcode } from "./commands/qrcode.js";
 import { restartDaemonDetached } from "./lib/daemon_control.js";
+import { getBridgeHome, getBridgeProfile } from "./lib/paths.js";
 
 const HELP = `codex-feishu
 
@@ -21,35 +22,6 @@ Usage:
   codex-feishu mcp (internal, for Codex MCP server)
   codex-feishu help
 `;
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function fetchQrcodeWithRetry(options = {}) {
-  const maxWaitMs = Number.isFinite(options.maxWaitMs) ? Math.max(1000, options.maxWaitMs) : 20000;
-  const intervalMs = Number.isFinite(options.intervalMs) ? Math.max(100, options.intervalMs) : 500;
-  const deadline = Date.now() + maxWaitMs;
-  let lastErr = null;
-
-  while (Date.now() < deadline) {
-    try {
-      return await fetchQrcode({
-        purpose: options.purpose ?? "init_daemon_start",
-        autostart: false,
-        cwdHint: options.cwdHint ?? process.cwd(),
-        timeoutMs: options.timeoutMs ?? 1500,
-      });
-    } catch (err) {
-      lastErr = err;
-      // Wait daemon socket ready after background spawn.
-      // eslint-disable-next-line no-await-in-loop
-      await sleep(intervalMs);
-    }
-  }
-
-  throw lastErr ?? new Error(`waited ${maxWaitMs}ms but qrcode is still unavailable`);
-}
 
 function parseArgs(argv) {
   const args = [];
@@ -89,6 +61,8 @@ function printDaemonStartSummary(result) {
   console.log(`- PID file: ${result.pidPath}`);
   // eslint-disable-next-line no-console
   console.log(`- Log file: ${result.logPath}`);
+  // eslint-disable-next-line no-console
+  console.log(`- Home: ${getBridgeHome()} (profile=${getBridgeProfile()})`);
   if (Array.isArray(result.stopResults) && result.stopResults.length > 1) {
     // eslint-disable-next-line no-console
     console.log(`- Cleaned stale daemons: ${result.stopResults.length}`);
@@ -112,28 +86,7 @@ export async function runCli(argv) {
     await runInit(flags, { startDaemon });
     if (startDaemon) {
       const result = await restartDaemonDetached();
-      const bindWaitMs = process.platform === "win32" ? 40000 : 20000;
       printDaemonStartSummary(result);
-      // eslint-disable-next-line no-console
-      console.log(`- Bind: waiting for daemon readiness (up to ${Math.round(bindWaitMs / 1000)}s)...`);
-
-      try {
-        const qr = await fetchQrcodeWithRetry({
-          purpose: "init_daemon_start",
-          cwdHint: process.cwd(),
-          maxWaitMs: bindWaitMs,
-          intervalMs: 500,
-          timeoutMs: 1500,
-        });
-        const asciiQr = await renderAsciiQr(qr?.qr_text);
-        // eslint-disable-next-line no-console
-        console.log("\nBind:");
-        // eslint-disable-next-line no-console
-        console.log(formatQrcodeSummary(qr, { asciiQr }));
-      } catch (err) {
-        // eslint-disable-next-line no-console
-        console.log(`\nBind: unavailable (${err?.message ?? String(err)})`);
-      }
     }
     return;
   }

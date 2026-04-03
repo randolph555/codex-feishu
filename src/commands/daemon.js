@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { execFile, execFileSync } from "node:child_process";
 import { AppServerClient } from "../lib/app_server_client.js";
+import { acquireAppInstanceLock, releaseAppInstanceLock } from "../lib/app_instance_lock.js";
 import { FeishuBridge } from "../lib/feishu_bridge.js";
 import { readJsonIfExists, readTextIfExists } from "../lib/fs_utils.js";
 import {
@@ -16,6 +17,7 @@ import {
   getCodexConfigPath,
   getCodexHome,
   getBridgeConfigPath,
+  getBridgeHome,
   getDaemonPidPath,
   getDefaultBridgeRpcEndpoint,
   getBridgeRpcEndpoint,
@@ -1701,7 +1703,11 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
         turn_id: normalized.turnId,
         message_id: null,
         full_text: "",
+        command_text: "",
+        file_text: "",
         truncated: false,
+        command_truncated: false,
+        file_truncated: false,
         last_markdown: "",
         last_note: "",
         footer: "",
@@ -1723,15 +1729,26 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
 
   const renderAssistantMarkdown = (state) => {
     const body = normalizeReadableText(state?.full_text ?? "");
+    const commandText = normalizeReadableText(state?.command_text ?? "");
+    const fileText = normalizeReadableText(state?.file_text ?? "");
     const footer = normalizeReadableText(state?.footer ?? "");
-    if (body && footer) {
-      return `${body}\n\n---\n${footer}`;
-    }
+    const sections = [];
     if (body) {
-      return body;
+      sections.push(body);
+    }
+    if (commandText) {
+      const safeCommandText = commandText.replace(/```/g, "``\\`");
+      sections.push(`**终端输出**\n\`\`\`\n${safeCommandText}\n\`\`\``);
+    }
+    if (fileText) {
+      const safeFileText = fileText.replace(/```/g, "``\\`");
+      sections.push(`**文件变更**\n\`\`\`\n${safeFileText}\n\`\`\``);
     }
     if (footer) {
-      return footer;
+      sections.push(`---\n${footer}`);
+    }
+    if (sections.length > 0) {
+      return sections.join("\n\n");
     }
     return "⏳ 正在生成…";
   };
@@ -1748,6 +1765,20 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
         state.truncated = true;
       }
     }
+    if (typeof options.commandText === "string" && options.commandText) {
+      state.command_text += options.commandText;
+      if (state.command_text.length > TERMINAL_CARD_KEEP_CHARS) {
+        state.command_text = state.command_text.slice(-TERMINAL_CARD_KEEP_CHARS);
+        state.command_truncated = true;
+      }
+    }
+    if (typeof options.fileText === "string" && options.fileText) {
+      state.file_text += options.fileText;
+      if (state.file_text.length > TERMINAL_CARD_KEEP_CHARS) {
+        state.file_text = state.file_text.slice(-TERMINAL_CARD_KEEP_CHARS);
+        state.file_truncated = true;
+      }
+    }
     if (typeof options.footer === "string") {
       state.footer = options.footer;
     }
@@ -1758,6 +1789,12 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
     const noteParts = [];
     if (state.truncated) {
       noteParts.push(`仅显示最近 ${ASSISTANT_CARD_KEEP_CHARS} 个字符，较早内容已折叠。`);
+    }
+    if (state.command_truncated) {
+      noteParts.push(`终端输出仅显示最近 ${TERMINAL_CARD_KEEP_CHARS} 个字符。`);
+    }
+    if (state.file_truncated) {
+      noteParts.push(`文件变更仅显示最近 ${TERMINAL_CARD_KEEP_CHARS} 个字符。`);
     }
     if (!state.completed) {
       noteParts.push("持续流式更新中…");
@@ -1828,7 +1865,11 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
         state.last_rate_limit_at = now;
         if (options.force) {
           setTimeout(() => {
-            void updateAssistantCard(routeRef, "", { footer: state.footer, completed: state.completed, force: true });
+            void updateAssistantCard(routeRef, "", {
+              footer: state.footer,
+              completed: state.completed,
+              force: true,
+            });
           }, 500);
         }
         return true;
@@ -1858,7 +1899,11 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
       return;
     }
     state.full_text = "";
+    state.command_text = "";
+    state.file_text = "";
     state.truncated = false;
+    state.command_truncated = false;
+    state.file_truncated = false;
     state.last_markdown = "";
     state.last_note = "";
     state.footer = "";
@@ -1879,7 +1924,10 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
         continue;
       }
       // eslint-disable-next-line no-await-in-loop
-      await updateAssistantCard(route, "", { footer, completed: false });
+      await updateAssistantCard(route, "", {
+        footer,
+        completed: false,
+      });
     }
   };
 
@@ -2020,6 +2068,15 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
     if (kind === "assistant") {
       for (const route of routes) {
         await updateAssistantCard(route, payloadText);
+      }
+      return;
+    }
+    if (singleCardMode && (kind === "command" || kind === "file")) {
+      for (const route of routes) {
+        await updateAssistantCard(route, "", {
+          commandText: kind === "command" ? payloadText : "",
+          fileText: kind === "file" ? payloadText : "",
+        });
       }
       return;
     }
@@ -2462,7 +2519,11 @@ function createFeishuRelay(store, feishu, appendEventFn, runtime = {}) {
         imageForwardSourceText = imageSourceText;
       }
       if (assistantText || fallbackAssistantText) {
-        await updateAssistantCard(route, assistantText ? "" : fallbackAssistantText, { footer, completed: true, force: true });
+        await updateAssistantCard(route, assistantText ? "" : fallbackAssistantText, {
+          footer,
+          completed: true,
+          force: true,
+        });
         if (!assistantState?.message_id) {
           await sendFallbackText(route, assistantText || fallbackAssistantText);
         }
@@ -3563,13 +3624,13 @@ function mapUserFacingError(err) {
     return "绑定码无效或已过期。请发送 `/rebind` 获取新绑定码。";
   }
   if (lower.includes("thread_not_found_rebind")) {
-    return "会话已失效，已尝试自动恢复。请重试；如仍失败发送 `/new`。";
+    return "会话已失效，已自动新建会话并恢复。";
   }
   if (lower.includes("feishu bridge not running")) {
     return "飞书桥接未就绪。请稍后重试；若持续失败，在终端执行 `codex-feishu init daemon`。";
   }
   if (isThreadNotFoundError(err)) {
-    return "会话已失效，已尝试自动恢复。请重试；如仍失败发送 `/new`。";
+    return "会话已失效，已自动新建会话并恢复。";
   }
   if (isAppServerExitError(err)) {
     return "Codex 后端连接中断，正在恢复。请稍后重试。";
@@ -3586,7 +3647,7 @@ function mapUserFacingError(err) {
   return `处理失败：${statusMarkdownFromText(raw)}`;
 }
 
-async function startNewThread(store, app, title) {
+async function startNewThread(store, app, title, options = {}) {
   const response = await app.startThread({
     serviceName: "codex_feishu",
   });
@@ -3594,19 +3655,21 @@ async function startNewThread(store, app, title) {
   if (!threadId) {
     throw new Error("thread/start response missing thread.id");
   }
-  await store.mutate((state) => {
-    state.active_thread_id = threadId;
-    if (title) {
-      state.thread_titles[threadId] = title;
-    }
-    ensureThreadBuffer(state, threadId);
-    pushRecentEvent(state, {
-      source: "daemon",
-      type: "thread_started",
-      thread_id: threadId,
+  if (options.persist !== false) {
+    await store.mutate((state) => {
+      state.active_thread_id = threadId;
+      if (title) {
+        state.thread_titles[threadId] = title;
+      }
+      ensureThreadBuffer(state, threadId);
+      pushRecentEvent(state, {
+        source: "daemon",
+        type: "thread_started",
+        thread_id: threadId,
+      });
+      return state;
     });
-    return state;
-  });
+  }
   return { threadId, thread: response.thread };
 }
 
@@ -3953,10 +4016,48 @@ async function startTurnWithAutoRecoverInput(store, app, threadId, input, chatId
           // try next candidate
         }
       }
-      throw new Error("thread_not_found_rebind");
+      const created = await startNewThread(store, app, null, { persist: false });
+      const turnResponse = await app.startTurn(created.threadId, input, turnParams);
+      const turnId = turnResponse?.turn?.id ?? null;
+      await store.mutate((state) => {
+        state.active_thread_id = created.threadId;
+        const buffer = ensureThreadBuffer(state, created.threadId);
+        if (buffer) {
+          buffer.current_turn_id = turnId;
+        }
+        updateBindingSession(state, chatId, {
+          active_thread_id: created.threadId,
+          active_cwd: cwdHint ?? binding?.active_cwd ?? null,
+          current_turn_id: turnId,
+        });
+        pushRecentEvent(state, {
+          source: "daemon",
+          type: "thread_auto_recovered_new",
+          chat_id: chatId,
+          recovered_from_thread_id: firstThreadId,
+          thread_id: created.threadId,
+          reason: err?.message ?? String(err),
+        });
+        return state;
+      });
+      return {
+        threadId: created.threadId,
+        turnResponse,
+        recovered: true,
+        recoveredFromThreadId: firstThreadId,
+      };
     }
-    const created = await startNewThread(store, app, null);
+    const created = await startNewThread(store, app, null, { persist: false });
     const turnResponse = await app.startTurn(created.threadId, input, turnParams);
+    const turnId = turnResponse?.turn?.id ?? null;
+    await store.mutate((state) => {
+      state.active_thread_id = created.threadId;
+      const buffer = ensureThreadBuffer(state, created.threadId);
+      if (buffer) {
+        buffer.current_turn_id = turnId;
+      }
+      return state;
+    });
     await appendEvent(store, {
       source: "daemon",
       type: "thread_auto_recovered",
@@ -4121,8 +4222,6 @@ async function handleAppNotification(store, app, msg, relay) {
       if (sawFirstToken) {
         relay.onFirstToken(routeRef);
       }
-    } else if (method === "item/commandExecution/outputDelta" && typeof params.delta === "string") {
-      relay.queue(routeRef, "command", params.delta);
     } else if (method === "item/fileChange/outputDelta" && typeof params.delta === "string") {
       relay.queue(routeRef, "file", params.delta);
     } else if (method === "item/started") {
@@ -6890,6 +6989,7 @@ export async function runDaemon() {
   const endpoint = getBridgeRpcEndpoint();
   const parsedEndpoint = parseRpcEndpoint(endpoint);
   const statePath = getBridgeStatePath();
+  const bridgeHome = getBridgeHome();
   const store = new StateStore(statePath);
   await store.load();
   const bridgeConfig = await readJsonIfExists(getBridgeConfigPath());
@@ -6903,6 +7003,13 @@ export async function runDaemon() {
   writePidFile(pidPath);
   if (parsedEndpoint.kind === "unix") {
     safeUnlink(parsedEndpoint.path);
+  }
+  let appInstanceLock = null;
+  try {
+    appInstanceLock = await acquireAppInstanceLock(bridgeConfig?.app_id ?? null);
+  } catch (err) {
+    removePidFileIfOwned(pidPath);
+    throw err;
   }
 
   const app = new AppServerClient({
@@ -7392,6 +7499,7 @@ export async function runDaemon() {
       try {
         await store.flush();
         removePidFileIfOwned(pidPath);
+        releaseAppInstanceLock(appInstanceLock);
         relay.shutdown();
         if (tuiMirror) {
           tuiMirror.shutdown();
@@ -7412,6 +7520,7 @@ export async function runDaemon() {
   process.on("exit", () => {
     try {
       removePidFileIfOwned(pidPath);
+      releaseAppInstanceLock(appInstanceLock);
     } catch {
       // noop
     }
@@ -7421,6 +7530,8 @@ export async function runDaemon() {
   console.log("codex-feishu daemon started");
   // eslint-disable-next-line no-console
   console.log(`rpc endpoint: ${endpoint}`);
+  // eslint-disable-next-line no-console
+  console.log(`home: ${bridgeHome}`);
   const defaultEndpoint = getDefaultBridgeRpcEndpoint();
   if (endpoint !== defaultEndpoint) {
     // eslint-disable-next-line no-console

@@ -3,16 +3,7 @@ import fs from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { ensureDir, readJsonIfExists, readTextIfExists, writeText } from "../lib/fs_utils.js";
 import { hasManagedMcpBlock, hasMcpServerSection, upsertManagedMcpBlock } from "../lib/install_config.js";
-import { getBridgeConfigPath, getBridgeHome, getCodexConfigPath, getPromptsDir } from "../lib/paths.js";
-
-const FEISHU_QRCODE_PROMPT_NAME = "feishu-qrcode";
-const FEISHU_QRCODE_PROMPT_ALIAS = "fq";
-const FEISHU_QRCODE_PROMPT = [
-  "Call the `feishu_qrcode` MCP tool.",
-  "Return the tool result directly.",
-  "Do not summarize away the QR text or ASCII block.",
-  "If the tool returns both a link and a bind command, keep both.",
-].join("\n");
+import { getBridgeConfigPath, getBridgeHome, getCodexConfigPath } from "../lib/paths.js";
 
 function buildBridgeConfig(flags, existing = {}) {
   return {
@@ -145,19 +136,6 @@ async function ensureCodexConfigHasMcpBlock() {
   return { updated: true, configPath };
 }
 
-async function ensureCodexPromptFiles() {
-  const promptsDir = getPromptsDir();
-  await ensureDir(promptsDir);
-
-  const promptMain = path.join(promptsDir, `${FEISHU_QRCODE_PROMPT_NAME}.md`);
-  const promptAlias = path.join(promptsDir, `${FEISHU_QRCODE_PROMPT_ALIAS}.md`);
-  await writeText(promptMain, `${FEISHU_QRCODE_PROMPT}
-`);
-  await writeText(promptAlias, `${FEISHU_QRCODE_PROMPT}
-`);
-  return { promptsDir, files: [promptMain, promptAlias] };
-}
-
 async function writeBridgeConfig(bridgeConfig) {
   const bridgeHome = getBridgeHome();
   const bridgeConfigPath = getBridgeConfigPath();
@@ -188,7 +166,6 @@ export async function runInit(flags, options = {}) {
   }
 
   const { updated, configPath } = await ensureCodexConfigHasMcpBlock();
-  const promptInfo = await ensureCodexPromptFiles();
   const { bridgeConfigPath } = await writeBridgeConfig(bridgeConfig);
 
   // eslint-disable-next-line no-console
@@ -197,7 +174,6 @@ export async function runInit(flags, options = {}) {
   console.log(`- Codex config: ${configPath}${updated ? " (updated)" : " (already configured)"}`);
   // eslint-disable-next-line no-console
   console.log(`- Bridge config: ${bridgeConfigPath}`);
-  console.log(`- Prompts: ${promptInfo.files.join(", ")}`);
   // eslint-disable-next-line no-console
   console.log(`- codex_bin: ${bridgeConfig.codex_bin ? bridgeConfig.codex_bin : "(default: codex in PATH)"}`);
   if (autoDetectedCodexBin) {
@@ -236,15 +212,14 @@ export async function runInit(flags, options = {}) {
     // eslint-disable-next-line no-console
     console.log("2) Start Codex normally: codex");
     // eslint-disable-next-line no-console
-    console.log(`3) In Codex use: /prompts:${FEISHU_QRCODE_PROMPT_NAME}`);
-    console.log("4) Bind info will also be printed automatically below (or refresh with: codex-feishu qrcode).");
+    console.log("3) After startup, chat with the Feishu bot directly.");
+    console.log("4) If you need bind info manually, run: codex-feishu qrcode");
   } else {
     // eslint-disable-next-line no-console
     console.log("1) Start daemon: codex-feishu daemon");
     // eslint-disable-next-line no-console
     console.log("2) Start Codex normally: codex");
-    // eslint-disable-next-line no-console
-    console.log(`3) In Codex use: /prompts:${FEISHU_QRCODE_PROMPT_NAME}`);
-    console.log("4) Or get bind info directly: codex-feishu qrcode");
+    console.log("3) Chat with the Feishu bot directly.");
+    console.log("4) If you need bind info manually, run: codex-feishu qrcode");
   }
 }

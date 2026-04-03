@@ -1,0 +1,952 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Codex Mobile UI Prototype</title>
+    <style>
+      :root {
+        --bg: #0a1016;
+        --bg-page: #0b1118;
+        --bg-phone: #181e27;
+        --bg-screen: #0f151d;
+        --bg-panel: #161d26;
+        --bg-panel-2: #141b24;
+        --bg-code: #111822;
+        --bg-soft: #2e3641;
+        --line: rgba(255, 255, 255, 0.08);
+        --line-2: rgba(255, 255, 255, 0.12);
+        --text: #e8edf5;
+        --text-soft: #b3bcc9;
+        --text-dim: #838d9b;
+        --text-faint: #697484;
+        --green: #68d789;
+        --yellow: #efb54a;
+        --safe-bottom: max(14px, env(safe-area-inset-bottom));
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        min-height: 100%;
+        background:
+          radial-gradient(circle at top left, rgba(68, 89, 124, 0.14), transparent 30%),
+          radial-gradient(circle at top right, rgba(45, 70, 114, 0.1), transparent 28%),
+          linear-gradient(180deg, var(--bg-page) 0%, #091018 100%);
+        color: var(--text);
+        font-family: "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
+      }
+
+      body {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+      }
+
+      .stage {
+        width: min(100%, 1040px);
+        display: grid;
+        grid-template-columns: minmax(260px, 380px) minmax(320px, 1fr);
+        gap: 24px;
+        align-items: center;
+      }
+
+      .pitch {
+        max-width: 360px;
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 12px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: rgba(14, 19, 27, 0.74);
+        color: var(--text-soft);
+        font-size: 11px;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+      }
+
+      .eyebrow::before {
+        content: "";
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--green);
+        box-shadow: 0 0 14px rgba(104, 215, 137, 0.36);
+      }
+
+      h1 {
+        margin: 16px 0 12px;
+        font-size: clamp(34px, 5.4vw, 54px);
+        line-height: 0.96;
+        letter-spacing: -0.055em;
+      }
+
+      .pitch p {
+        margin: 0;
+        color: var(--text-soft);
+        font-size: 14px;
+        line-height: 1.72;
+      }
+
+      .chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 18px;
+      }
+
+      .chip {
+        padding: 8px 12px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: rgba(15, 22, 31, 0.76);
+        color: var(--text-soft);
+        font-size: 12px;
+      }
+
+      .phone {
+        position: relative;
+        width: min(100%, 356px);
+        min-height: 844px;
+        padding: 12px;
+        border-radius: 34px;
+        background:
+          linear-gradient(180deg, rgba(255, 255, 255, 0.05), transparent 18%),
+          linear-gradient(180deg, var(--bg-phone) 0%, #0d1219 100%);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        box-shadow:
+          0 0 0 1px rgba(255, 255, 255, 0.03) inset,
+          0 28px 78px rgba(0, 0, 0, 0.5),
+          0 12px 24px rgba(0, 0, 0, 0.28);
+      }
+
+      .phone::before {
+        content: "";
+        position: absolute;
+        top: 9px;
+        left: 50%;
+        width: 122px;
+        height: 26px;
+        transform: translateX(-50%);
+        border-radius: 0 0 16px 16px;
+        background: #060b10;
+        z-index: 3;
+      }
+
+      .screen {
+        position: relative;
+        overflow: hidden;
+        min-height: 820px;
+        border-radius: 24px;
+        background:
+          radial-gradient(circle at top center, rgba(62, 85, 122, 0.1), transparent 24%),
+          linear-gradient(180deg, var(--bg-screen) 0%, #0c1219 100%);
+      }
+
+      .statusbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 12px 16px 8px;
+        font-size: 10px;
+        color: var(--text-soft);
+      }
+
+      .statusbar .time {
+        color: var(--text);
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      .status-meta {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+
+      .toolbar {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 3px 10px 12px;
+      }
+
+      .nav-btn,
+      .dot-btn {
+        width: 28px;
+        height: 28px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 9px;
+        border: 1px solid var(--line);
+        background: rgba(22, 30, 41, 0.94);
+        color: var(--text-soft);
+        flex: none;
+      }
+
+      .channel {
+        min-width: 0;
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 10px 12px;
+        border-radius: 12px;
+        border: 1px solid var(--line);
+        background: linear-gradient(180deg, rgba(21, 29, 40, 0.98), rgba(18, 26, 36, 0.98));
+      }
+
+      .channel-title {
+        min-width: 0;
+      }
+
+      .channel-title strong {
+        display: block;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 13px;
+      }
+
+      .channel-title span {
+        display: block;
+        margin-top: 2px;
+        color: var(--text-dim);
+        font-size: 10px;
+      }
+
+      .channel-status {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        color: var(--text-soft);
+        font-size: 11px;
+        white-space: nowrap;
+      }
+
+      .channel-status::before,
+      .ok-dot::before {
+        content: "";
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--green);
+        box-shadow: 0 0 10px rgba(104, 215, 137, 0.38);
+      }
+
+      .chat-scroll {
+        height: 694px;
+        overflow: auto;
+        padding: 0 8px calc(112px + var(--safe-bottom));
+        scrollbar-width: none;
+      }
+
+      .chat-scroll::-webkit-scrollbar {
+        display: none;
+      }
+
+      .inline-status {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin: 6px 2px 10px;
+        color: var(--text-faint);
+        font-size: 10px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .inline-status::before {
+        content: "";
+        width: 18px;
+        height: 1px;
+        background: rgba(255, 255, 255, 0.12);
+      }
+
+      .panel {
+        margin-bottom: 12px;
+        border-radius: 12px;
+        border: 1px solid var(--line);
+        background: linear-gradient(180deg, var(--bg-panel) 0%, var(--bg-panel-2) 100%);
+        box-shadow: 0 8px 16px rgba(0, 0, 0, 0.16);
+      }
+
+      .panel-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 10px 11px 8px;
+        color: var(--text-soft);
+        font-size: 11px;
+      }
+
+      .panel-title {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+      }
+
+      .badge {
+        height: 24px;
+        min-width: 28px;
+        padding: 0 9px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        background: rgba(255, 255, 255, 0.05);
+        color: var(--text-soft);
+        font-size: 11px;
+        font-weight: 700;
+        flex: none;
+      }
+
+      .panel-text {
+        min-width: 0;
+      }
+
+      .panel-text strong {
+        display: block;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 12px;
+      }
+
+      .panel-text span {
+        display: block;
+        margin-top: 2px;
+        color: var(--text-dim);
+        font-size: 10px;
+      }
+
+      .head-state {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        color: var(--text-dim);
+        font-size: 11px;
+      }
+
+      .ok-dot {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+      }
+
+      .codebox {
+        margin: 0 10px 10px;
+        border-radius: 8px;
+        overflow: hidden;
+        border: 1px solid rgba(255, 255, 255, 0.05);
+        background: var(--bg-code);
+      }
+
+      .codebox-top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 8px 10px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        font-size: 11px;
+        color: var(--text-soft);
+      }
+
+      .codebox pre,
+      .action-pre {
+        margin: 0;
+        padding: 10px;
+        color: #aeb8c7;
+        background: var(--bg-code);
+        font-family: "SF Mono", "JetBrains Mono", monospace;
+        font-size: 10.5px;
+        line-height: 1.55;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .flow {
+        display: grid;
+        gap: 10px;
+        margin: 0 0 12px;
+      }
+
+      .flow-row {
+        display: grid;
+        grid-template-columns: 10px 1fr;
+        gap: 8px;
+        align-items: start;
+      }
+
+      .flow-dot,
+      .ghost-dot {
+        width: 5px;
+        height: 5px;
+        margin-top: 8px;
+        border-radius: 50%;
+        background: rgba(229, 235, 243, 0.84);
+      }
+
+      .flow-copy {
+        color: var(--text-soft);
+        font-size: 12px;
+        line-height: 1.62;
+      }
+
+      .flow-copy p {
+        margin: 0;
+      }
+
+      .flow-copy p + p {
+        margin-top: 8px;
+      }
+
+      .flow-copy strong {
+        color: var(--text);
+      }
+
+      .inline-code {
+        display: inline-block;
+        padding: 0 5px;
+        border-radius: 5px;
+        background: rgba(255, 255, 255, 0.08);
+        color: #e0e6ef;
+        font-family: "SF Mono", "JetBrains Mono", monospace;
+        font-size: 11px;
+      }
+
+      .tool-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        margin: 8px 0 0;
+        padding: 5px 7px;
+        border-radius: 6px;
+        border: 1px solid rgba(255, 255, 255, 0.05);
+        background: rgba(255, 255, 255, 0.05);
+        color: var(--text-soft);
+        font-size: 10px;
+      }
+
+      .tool-chip::before {
+        content: "";
+        width: 6px;
+        height: 6px;
+        border-radius: 2px;
+        background: rgba(255, 255, 255, 0.34);
+      }
+
+      .soft-bubble {
+        margin: 10px 0 0 18px;
+        padding: 12px 14px;
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        background: linear-gradient(180deg, rgba(49, 58, 72, 0.88), rgba(40, 49, 62, 0.88));
+        color: #dfe6f0;
+        font-size: 12px;
+        line-height: 1.56;
+      }
+
+      .thinking-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 0 0 10px;
+        color: var(--text-dim);
+        font-size: 12px;
+      }
+
+      .thinking-row .ghost-dot {
+        margin-top: 0;
+        background: rgba(255, 255, 255, 0.25);
+      }
+
+      .thinking-row .caret {
+        font-size: 11px;
+      }
+
+      .section-divider {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 10px 0 8px;
+        color: var(--text-faint);
+        font-size: 10px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .section-divider::before,
+      .section-divider::after {
+        content: "";
+        flex: 1;
+        height: 1px;
+        background: rgba(255, 255, 255, 0.06);
+      }
+
+      .action-card {
+        margin-bottom: 10px;
+        overflow: hidden;
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.07);
+        background: linear-gradient(180deg, rgba(21, 29, 40, 0.98), rgba(17, 24, 34, 0.98));
+      }
+
+      .action-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 9px 10px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        font-size: 11px;
+        color: var(--text-soft);
+      }
+
+      .action-left {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+      }
+
+      .action-icon {
+        width: 16px;
+        height: 16px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 4px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        background: rgba(255, 255, 255, 0.03);
+        color: var(--text-dim);
+        flex: none;
+      }
+
+      .action-left strong {
+        font-size: 11px;
+        color: var(--text-soft);
+        font-weight: 600;
+      }
+
+      .action-right {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .action-right::before {
+        content: "";
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--green);
+        box-shadow: 0 0 10px rgba(104, 215, 137, 0.38);
+      }
+
+      .composer {
+        position: absolute;
+        right: 0;
+        bottom: 0;
+        left: 0;
+        padding: 8px 8px calc(8px + var(--safe-bottom));
+        background:
+          linear-gradient(180deg, rgba(12, 18, 26, 0), rgba(12, 18, 26, 0.82) 22%, rgba(12, 18, 26, 0.98) 42%);
+        backdrop-filter: blur(16px);
+      }
+
+      .composer-box {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        align-items: stretch;
+        gap: 0;
+        overflow: hidden;
+        border-radius: 12px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        background: rgba(22, 30, 41, 0.98);
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.22);
+      }
+
+      .composer-input {
+        display: flex;
+        align-items: flex-end;
+        gap: 8px;
+        min-width: 0;
+        padding: 8px 8px 8px 10px;
+      }
+
+      .icon-btn,
+      .send-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border: 0;
+        cursor: pointer;
+      }
+
+      .icon-btn {
+        width: 30px;
+        height: 30px;
+        flex: none;
+        border-radius: 9px;
+        border: 1px solid rgba(255, 255, 255, 0.05);
+        background: rgba(255, 255, 255, 0.04);
+        color: var(--text-soft);
+      }
+
+      .composer-box textarea {
+        width: 100%;
+        min-height: 42px;
+        max-height: 108px;
+        resize: none;
+        border: 0;
+        outline: 0;
+        background: transparent;
+        color: var(--text);
+        font: inherit;
+        font-size: 12px;
+        line-height: 1.45;
+        padding: 8px 2px 6px;
+      }
+
+      .composer-box textarea::placeholder {
+        color: var(--text-dim);
+      }
+
+      .send-btn {
+        width: 46px;
+        background: linear-gradient(180deg, #f6c14d, #eda625);
+        color: #2d1c00;
+      }
+
+      .composer-meta {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-top: 7px;
+        padding: 0 2px;
+        color: var(--text-dim);
+        font-size: 11px;
+      }
+
+      .composer-meta .left,
+      .composer-meta .right {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .meta-dot {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+      }
+
+      .meta-dot::before {
+        content: "";
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--green);
+        box-shadow: 0 0 10px rgba(104, 215, 137, 0.35);
+      }
+
+      .meta-dot.warn::before {
+        background: var(--yellow);
+        box-shadow: 0 0 10px rgba(239, 181, 74, 0.35);
+      }
+
+      @media (max-width: 980px) {
+        body {
+          padding: 18px;
+        }
+
+        .stage {
+          grid-template-columns: 1fr;
+          justify-items: center;
+        }
+
+        .pitch {
+          max-width: 620px;
+          text-align: center;
+        }
+
+        .pitch p {
+          margin: 0 auto;
+        }
+
+        .chips {
+          justify-content: center;
+        }
+      }
+
+      @media (max-width: 520px) {
+        body {
+          display: block;
+          padding: 0;
+          background: #08101a;
+        }
+
+        .stage {
+          width: 100%;
+          gap: 0;
+        }
+
+        .pitch {
+          display: none;
+        }
+
+        .phone {
+          width: 100%;
+          min-height: 100vh;
+          padding: 0;
+          border: 0;
+          border-radius: 0;
+          box-shadow: none;
+          background: transparent;
+        }
+
+        .phone::before {
+          display: none;
+        }
+
+        .screen {
+          min-height: 100vh;
+          border-radius: 0;
+        }
+
+        .chat-scroll {
+          height: calc(100vh - 108px);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="stage">
+      <section class="pitch">
+        <div class="eyebrow">Codex Mobile Surface</div>
+        <h1>把 Codex 做成更像移动端 Claude Code 的远程工作台。</h1>
+        <p>
+          这版不再追泛用聊天页，而是把字体、字号、卡片密度、说明流、折叠 thinking、代码块和底部 composer 都尽量往你发的截图靠。重点是像“移动端 coding console”，不是像普通 IM。
+        </p>
+        <div class="chips">
+          <span class="chip">Smaller type</span>
+          <span class="chip">Denser cards</span>
+          <span class="chip">Collapsed thinking</span>
+          <span class="chip">Closer to screenshot</span>
+        </div>
+      </section>
+
+      <section class="phone" aria-label="Codex mobile prototype">
+        <div class="screen">
+          <div class="statusbar">
+            <div>中国移动 5G</div>
+            <div class="time">03:39</div>
+            <div class="status-meta">
+              <span>0.83KB/s</span>
+              <span>77%</span>
+            </div>
+          </div>
+
+          <div class="toolbar">
+            <button class="nav-btn" type="button" aria-label="返回">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                <path d="M15 5L8 12L15 19" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </button>
+
+            <div class="channel">
+              <div class="channel-title">
+                <strong>rc-server dev</strong>
+                <span>Codex thread / Mobile render preview</span>
+              </div>
+              <div class="channel-status">Connected</div>
+            </div>
+
+            <button class="dot-btn" type="button" aria-label="更多">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                <circle cx="5" cy="12" r="1.7"></circle>
+                <circle cx="12" cy="12" r="1.7"></circle>
+                <circle cx="19" cy="12" r="1.7"></circle>
+              </svg>
+            </button>
+          </div>
+
+          <div class="chat-scroll">
+            <div class="inline-status">Live Turn / 77.7% Context</div>
+
+            <article class="panel">
+              <div class="panel-head">
+                <div class="panel-title">
+                  <div class="badge">Bash</div>
+                  <div class="panel-text">
+                    <strong>Build verification</strong>
+                    <span>pnpm build 2&gt;&amp;1 | tail -3</span>
+                  </div>
+                </div>
+                <div class="head-state ok-dot">done</div>
+              </div>
+
+              <div class="codebox">
+                <div class="codebox-top">
+                  <strong>pnpm build 2&gt;&amp;1 | tail -3</strong>
+                  <span>4.96s</span>
+                </div>
+                <pre>$ pnpm build 2&gt;&amp;1 | tail -3
+Use build.rollupOptions.output.manualChunks to improve chunking: https://rollupjs.org/configuration-options/#output-manualchunks
+Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.
+✓ built in 4.96s</pre>
+              </div>
+            </article>
+
+            <div class="flow">
+              <div class="flow-row">
+                <div class="flow-dot"></div>
+                <div class="flow-copy">
+                  <p><strong>构建通过。</strong></p>
+                  <p>用户的补充确认了我的判断。第一张图是 CLI 每个 turn 都有一个点，第二张图是我的 RC Web 版。</p>
+                </div>
+              </div>
+
+              <div class="flow-row">
+                <div class="flow-dot"></div>
+                <div class="flow-copy">
+                  <p>一张图里真正确认的是软换行逻辑，修复前最大的问题是 <strong>assistant 不再合并成组</strong>。之前连续的 assistant 消息会被塞进同一个 <span class="inline-code">MessageGroup</span> 共享一个点位，现在每个 assistant <span class="inline-code">ProcessedMessage</span> 独立成组，各自拥有自己的前导圆点，和 CLI 的行为一致。</p>
+                  <div class="tool-chip">行为</div>
+                  <div class="codebox" style="margin: 8px 0 0;">
+                    <pre>之前: [assistant msg1, msg2, msg3] -> 1 个 MessageGroup -> 1 个圆点
+现在: [assistant msg1] -> ● , [assistant msg2] -> ● , [assistant msg3] -> ●</pre>
+                  </div>
+                </div>
+              </div>
+
+              <div class="flow-row">
+                <div class="flow-dot"></div>
+                <div class="flow-copy">
+                  <p>User 和 system 消息保持合并，因为它们在视觉上属于同一段，例如多行用户输入。</p>
+                </div>
+              </div>
+            </div>
+
+            <div class="soft-bubble">
+              现在正确了，但 Tool 块没有正缝避免命中圆点。只有包含 <span class="inline-code">text/thinking</span> 内容的消息才需要。
+            </div>
+
+            <div class="thinking-row">
+              <div class="ghost-dot"></div>
+              <span>Thinking...</span>
+              <span class="caret">⌄</span>
+            </div>
+
+            <div class="flow-row" style="margin-bottom: 12px;">
+              <div class="flow-dot" style="margin-top: 7px;"></div>
+              <div class="flow-copy">
+                <p>明确一点，tool use 的消息不应该显示悬挂圆点。只有包含 <span class="inline-code">text/thinking</span> 内容的消息才需要。</p>
+              </div>
+            </div>
+
+            <div class="section-divider">Workspace Signals</div>
+
+            <article class="action-card">
+              <div class="action-bar">
+                <div class="action-left">
+                  <span class="action-icon">
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none">
+                      <path d="M6 5H18V19H6V5Z" stroke="currentColor" stroke-width="1.8" />
+                    </svg>
+                  </span>
+                  <strong>Read MessageGroup.vue</strong>
+                  <span>L34-80</span>
+                </div>
+                <div class="action-right"></div>
+              </div>
+            </article>
+
+            <article class="action-card">
+              <div class="action-bar">
+                <div class="action-left">
+                  <span class="action-icon">
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none">
+                      <path d="M5 17.5L17.6 4.9L19.1 6.4L6.5 19H5V17.5Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" />
+                    </svg>
+                  </span>
+                  <strong>Edit MessageGroup.vue</strong>
+                  <span>+12 -13</span>
+                </div>
+                <div class="action-right"></div>
+              </div>
+              <pre class="action-pre">/**
+ * Whether the first non-thinking block is text — used to decide
+ * if the dot needs text-indent (margin-left) on the first block.
+ */
+const firstBlockIsText = computed(() =&gt; {
+  for (const msg of props.messages) {
+    for (const block of msg.blocks) {
+-const shouldIndentMessageDot = computed(() =&gt;
+-  props.messages.some((msg) =&gt; msg.kind === "assistant")
+-);</pre>
+            </article>
+          </div>
+
+          <div class="composer">
+            <div class="composer-box">
+              <div class="composer-input">
+                <button class="icon-btn" type="button" aria-label="附件">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none">
+                    <path d="M12 4V20M4 12H20" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+                  </svg>
+                </button>
+                <label aria-label="Message input" style="display:block; min-width:0; width:100%;">
+                  <textarea placeholder="Type a message..."></textarea>
+                </label>
+              </div>
+
+              <button class="send-btn" type="button" aria-label="发送">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                  <path d="M4 11.5L19.5 4L15.2 20L11.4 13.9L4 11.5Z" fill="currentColor" />
+                </svg>
+              </button>
+            </div>
+
+            <div class="composer-meta">
+              <div class="left">
+                <span class="meta-dot">Sonnet 4.5</span>
+                <span>Default</span>
+              </div>
+              <div class="right">
+                <span class="meta-dot warn">77.7%</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      const textarea = document.querySelector("textarea");
+      if (textarea) {
+        const resize = () => {
+          textarea.style.height = "0px";
+          textarea.style.height = `${Math.min(textarea.scrollHeight, 108)}px`;
+        };
+        textarea.addEventListener("input", resize);
+        resize();
+      }
+    </script>
+  </body>
+</html>
